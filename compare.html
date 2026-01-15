@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文本比较工具</title>
+    <!-- 引入 diff2html 的 CSS 文件 -->
+    <link href="./lib/diff2html/css/diff2html.min.css" rel="stylesheet" type="text/css" />
+    <!-- 引入 diff 和 diff2html-ui 的 JS 文件 -->
+    <script type="text/javascript" src="./lib/diff/diff.js"></script>
+    <script type="text/javascript" src="./lib/diff2html/js/diff2html-ui.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        .comparison-container {
+            margin-top: 20px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            position: relative;
+        }
+        .textarea-container {
+            display: flex;
+            align-items: center;
+        }
+        textarea {
+            width: 47%;
+            height: 100px;
+            margin-bottom: 10px;
+        }
+        #compare-btn {
+            height: 110px;
+            margin-left: 10px;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 5px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        #comparison-result {
+            margin-top: 5px;
+            min-height: 300px;
+            overflow: auto;
+        }
+        .diff-nav-buttons {
+            position: fixed;
+            top: 50%;
+            right: 10px;
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            z-index: 10;
+            margin-right: 13px;
+        }
+        .diff-nav-buttons button {
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h1>文本比较工具</h1>
+    <div class="comparison-container">
+        <div class="textarea-container">
+            <textarea id="text1" placeholder="输入第一个文本"></textarea>
+            <textarea id="text2" placeholder="输入第二个文本"></textarea>
+            <button id="compare-btn" onclick="compareTexts()">比较文本</button>
+        </div>
+        <div class="diff-nav-buttons">
+            <button onclick="prevDiff()">上一个差异</button>
+            <button onclick="nextDiff()">下一个差异</button>
+        </div>
+        <div id="comparison-result"></div>
+    </div>
+
+    <script>
+        // test code， 自动生成1到100的数字
+        document.getElementById('text1').value = Array.from({ length: 100 }, (_, i) => i + 1).join('\n');
+        document.getElementById('text2').value = Array.from({ length: 100 }, (_, i) => i + 1).map(i => i % 2 === 0 ? i : i + 1).join('\n');
+        
+        let diff2htmlUi = null;
+        let currentDiffIndex = -1;
+        let diffs = [];
+
+        function compareTexts() {
+            // 获取两个文本框中的内容
+            const text1 = document.getElementById('text1').value;
+            const text2 = document.getElementById('text2').value;
+
+            // 使用 Diff.js 计算差异
+            const diff = Diff.diffLines(text1, text2);
+
+            // 将 diff 转换为 Diff2Html 所需的格式
+            let addedCount = 0;
+            let removedCount = 0;
+            const diffStringParts = diff.map(part => {
+                const prefix = part.added ? '+' : part.removed ? '-' : ' ';
+                // 将文本按行切割，并移除因结尾 \n 产生的空行
+                let lines = part.value.split('\n');
+                if (lines.length && lines[lines.length - 1] === '') {
+                    lines.pop();
+                }
+                // 更新计数器
+                if (part.added) {
+                    addedCount += lines.length;
+                }
+                if (part.removed) {
+                    removedCount += lines.length;
+                }
+                return lines.map(line => `${prefix}${line}`).join('\n');
+            });
+
+            // 构造 diffString
+            const diffString = `diff --git a/text1 b/text2
+index 0000001..0ddf2ba
+--- a/text1
++++ b/text2
+@@ -1,${removedCount} +1,${addedCount} @@
+${diffStringParts.join('\n')}
+`;
+
+            // 获取目标元素
+            const targetElement = document.getElementById('comparison-result');
+
+            // 配置 Diff2HtmlUI
+            const configuration = {
+                drawFileList: false,
+                matching: 'lines',
+                outputFormat: 'side-by-side', // 使用 side-by-side 模式，可选 line-by-line
+                synchronisedScroll: true,
+                highlight: true,
+                renderNothingWhenEmpty: false
+            };
+
+            // 创建 Diff2HtmlUI 实例并渲染
+            diff2htmlUi = new Diff2HtmlUI(targetElement, diffString, configuration);
+            diff2htmlUi.draw();
+            diff2htmlUi.highlightCode();
+
+            // 获取所有的差异元素
+            diffs = targetElement.querySelectorAll('.d2h-ins, .d2h-del');
+            currentDiffIndex = -1;
+        }
+
+        function prevDiff() {
+            if (diffs.length === 0) return;
+
+            currentDiffIndex = (currentDiffIndex - 1 + diffs.length) % diffs.length;
+            scrollToDiff();
+        }
+
+        function nextDiff() {
+            if (diffs.length === 0) return;
+
+            currentDiffIndex = (currentDiffIndex + 1) % diffs.length;
+            scrollToDiff();
+        }
+
+        function scrollToDiff() {
+            if (currentDiffIndex >= 0 && currentDiffIndex < diffs.length) {
+                diffs[currentDiffIndex].scrollIntoView({ behavior: 'smooth' });
+            }
+        }
+    </script>
+</body>
+</html>
