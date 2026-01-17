@@ -1,0 +1,40 @@
+{
+    // 核心解决方案：禁用文件监听和索引
+  "files.useExperimentalFileWatcher": true,
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/dist/**": true
+  },
+  
+  // 禁止搜索索引 asar 文件
+  "search.exclude": {
+    "**/dist/**": true
+  },
+  
+  // 防止 VS Code 解析 asar 文件
+  "files.associations": {
+    "*.asar": "binary"
+  },
+  
+  // 禁用后台 Git 进程
+  "git.enabled": false,
+  "git.autorefresh": false,
+  
+  // 禁用工作区符号索引
+  "workspace.symbols.enabled": false,
+  
+  // 关闭文件预览
+  "workbench.editor.enablePreview": false,
+  
+  // Electron 开发专用设置
+  "electron.enableAsarProtection": false,
+
+    // 强制 VS Code 释放文件句柄
+  "files.hotExit": "off",
+  
+  // 禁用内存缓存
+  "files.useMemoryCache": false,
+  
+  // 特别针对 Electron 项目的优化
+  "electron.experimentalDisableAsarLocking": true
+}

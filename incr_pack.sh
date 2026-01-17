@@ -67,6 +67,6 @@ for file in $diff_files; do
 done
 
 Info "压缩增加文件到 $dist_dir.tar.gz"
-tar -zcvf  $dist_dir.$version.incr.tar.gz.zip  $incr_dir/*;
+tar -zcvf  $dist_dir.repo-viewer.$version.incr.tar.gz.zip  $incr_dir/*;
 CheckOption "压缩$dist_dir.tar.gz"
 
