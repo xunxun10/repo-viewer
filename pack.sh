@@ -20,10 +20,21 @@ function CheckOption(){
     fi
 }
 
-op_flag=$1;
-if [ $op_flag == 'clean' ]; then
-    Info "开始清理 $S_DIR/dist/win-unpacked  $S_DIR/dist/incr"
-    rm -rf $S_DIR/dist/win-unpacked $S_DIR/dist/incr;
+op_flag=$1;	# claen
+
+
+if [ `uname -m` == "x86_64" ]; then
+    dist_dir="dist/win-unpacked"
+elif [ `uname -m` == "aarch64" ]; then
+    dist_dir="dist/linux-arm64-unpacked"
+else
+    Error "不支持的平台";
+    exit 1;
+fi
+
+if [ "$op_flag" == 'clean' ]; then
+    Info "开始清理 $S_DIR/$dist_dir  $S_DIR/dist/incr"
+    rm -rf $S_DIR/$dist_dir $S_DIR/dist/incr;
     exit 0;
 fi
 
@@ -53,7 +64,7 @@ elif [ `uname -m` == "aarch64" ]; then
     cd $S_DIR/dist;
 
     Info "开始将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.tar.gz ...";
-    rm -rf repo-viewer-linux-arm64*.tar.gz repo-viewer-linux-arm64*.zip repo-viewer-linux-arm64;
+    rm -rf *.AppImage *.tar.gz *.zip repo-viewer-linux-arm64;
     mv linux-arm64-unpacked repo-viewer-linux-arm64 && 
         tar -zcf repo-viewer-linux-arm64-$version.tar.gz repo-viewer-linux-arm64 &&
         split -b 40m repo-viewer-linux-arm64-$version.tar.gz repo-viewer-linux-arm64-$version.tar.gz.part. &&

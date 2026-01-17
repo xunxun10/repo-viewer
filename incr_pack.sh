@@ -22,6 +22,8 @@ function CheckOption(){
 
 label_flag=$1
 
+version=$(grep 'version' $S_DIR/package.json | awk -F '"' '{print $4}')
+
 label_file="dist.files.md5.txt"
 if [ `uname -m` == "x86_64" ]; then
     dist_dir="dist/win-unpacked"
@@ -47,7 +49,7 @@ if [ "$new_md5" == "$old_md5" ]; then
 fi
 
 incr_dir="./dist/incr"
-diff_files=$(diff <(echo "$new_md5") <(echo "$old_md5") | grep "^< " | sed 's/.*\s\*//g')
+diff_files=$(diff <(echo "$new_md5") <(echo "$old_md5") | grep "^< " | sed -r 's#.*\s\*?./dist#./dist#g')
 Info "文件有变化:\n$diff_files"
 
 rm -rf "$incr_dir" && mkdir -p "$incr_dir"
@@ -63,3 +65,8 @@ for file in $diff_files; do
     cp "$file" "$incr_dir/$rel_path"
     CheckOption "复制文件失败"
 done
+
+Info "压缩增加文件到 $dist_dir.tar.gz"
+tar -zcvf  $dist_dir.$version.incr.tar.gz.zip  $incr_dir/*;
+CheckOption "压缩$dist_dir.tar.gz"
+
