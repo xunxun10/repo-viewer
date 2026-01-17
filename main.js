@@ -101,7 +101,7 @@ function CreateMenu(){
 }
 
 function Init(){
-    MyLog.Init(path.join(g_sys_params.local_data_dir, 'logs', 'app'), true);
+    MyLog.Init(path.join(g_sys_params.local_data_dir, 'logs', 'app'));
 
     g_conf = new MyConf(path.join(g_sys_params.local_data_dir, g_sys_params.config_file_name));
     g_sys_params.db_file = path.join(g_sys_params.local_data_dir, g_sys_params.db_file_name);
@@ -246,8 +246,7 @@ function CallWeb(type, data=null){
 async function SetLastRepo(repo_url){
     // 保存最后访问的仓库到访问列表
     g_conf.Set('last_repo', repo_url)
-    g_sys_params.cur_repo_viewer = new RepoViewer(repo_url, g_sys_params.user, 
-        g_sys_params.password, os_type, g_sys_params.repo_cache_dir);
+    // 注意此处的repo_url不包含版本号
     if(await viewer_db.AddAccessedRepo(repo_url)){
         CallWeb('init-accessed-repo-list', await viewer_db.GetAccessedRepos());
     }
@@ -271,6 +270,7 @@ async function RefreshRepoTree(repo_url=null, init_flag=false){
         }
         // 如果repo_url包含版本号，需要去除，只有@符号后面没有/时才是版本号分隔符
         if (repo_url && repo_url.indexOf('@') > 0 && repo_url.indexOf('/', repo_url.indexOf('@')) === -1) {
+            // 如果包含版本需要去除，版本号已经初始化在了api对象中，无需此处传入
             repo_url = repo_url.substring(0, repo_url.indexOf('@'));
         }
         let repo_tree = await g_sys_params.cur_repo_viewer.Api().GetRepoTree(repo_url);
@@ -397,6 +397,12 @@ function HandleWebMsg(event, msg){
             "get-repo-log":function(v){
                 g_sys_params.cur_repo_viewer.Api().GetRepoLog(v).then((data) => {
                     CallWeb('show-repo-log', data)
+                    ShowCacheStatus();
+                })
+            },
+            "get-more-repo-log":function(v){
+                g_sys_params.cur_repo_viewer.Api().GetRepoLog(v.path, null, v.from_revision).then((data) => {
+                    CallWeb('show-more-repo-log', data)
                     ShowCacheStatus();
                 })
             },

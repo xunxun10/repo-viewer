@@ -21,9 +21,11 @@
 
     <script type="text/javascript" src="./lib/jqueryui.combobox.js"></script>
     <script type="text/javascript" src="./util/my_util.js"></script>
-    <script type="text/javascript" src="./src/renderer/file_view.js"></script>
-    <script type="text/javascript" src="./src/renderer/top_menu.js"></script>
     <script type="text/javascript" src="./renderer.js"></script>
+    <script type="text/javascript" src="./src/renderer/top_menu.js"></script>
+    <script type="text/javascript" src="./src/renderer/tree_node.js"></script>
+    <script type="text/javascript" src="./src/renderer/show_log.js"></script>
+    <script type="text/javascript" src="./src/renderer/file_view.js"></script>
 
     <link href="./lib/diff2html/css/diff2html.min.css" rel="stylesheet" type="text/css" />
 
@@ -35,7 +37,7 @@
   </head>
   <body>
     <div class="info-div">
-      <input class="access-input" type="text" id="repo-url" placeholder="输代码仓库地址" spellcheck="false"/>
+      <input class="access-input" type="text" id="repo-url" placeholder="输源代码仓库地址" spellcheck="false"/>
       <button id="settings-btn" class="top-btn" title="edit accessed repo info">
         <i class="glyphicon glyphicon-cog"></i>
       </button>
@@ -58,6 +60,7 @@
                 <span class='file-author sortable' data-sort-key="author">Author</span>
                 <span class='file-date sortable' data-sort-key="date">Date</span>
             </div>
+            <div id='repo-dir-list'></div>
             <div id='repo-file-list'></div>
         </div>
     </div>

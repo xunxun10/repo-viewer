@@ -108,7 +108,7 @@ class GitCommandApi {
                 const git_exe = 'git';
                 cmd_str = `${git_exe} ${cmd_params}`;
             }
-            MyLog.Info(`command: ${cmd_str}`);
+            MyLog.Debug(`git command: ${cmd_str}`);
             exec(cmd_str, { cwd, maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
                 if (error) {
                     error.message += `\nCommand: ${cmd_str}`;
@@ -226,7 +226,7 @@ class GitCommandApi {
         }
 
         if (this.submodule_path_dict === null) {
-            MyLog.Info('init submodule_path_dict');
+            MyLog.Debug('init submodule_path_dict');
             this.submodule_path_dict = await this._GetSubmodulePath();
         }
     }
@@ -300,17 +300,22 @@ class GitCommandApi {
                 try {
                     // 获取tag指向的最后一次提交的日期
                     const dateRes = await this._GetGitCommandResult(`log -1 --pretty=format:"%ad" --date=iso ${tag}`);
-                    return { tag, date: new Date(dateRes.trim()) };
+                    const d = new Date(dateRes.trim());
+                    // 如果解析失败，使用 epoch(0) 作为 fallback（保证不可用日期排在末尾）
+                    return { tag, date: isNaN(d.getTime()) ? new Date(0) : d };
                 } catch (error) {
-                    // 如果无法获取提交时间，使用当前时间作为fallback
-                    return { tag, date: new Date() };
+                    // 如果无法获取提交时间，使用 epoch(0) 作为 fallback
+                    return { tag, date: new Date(0) };
                 }
             }));
-            
-            // 按时间降序排序，取最新的50个
+
+            // 按时间降序排序；对于相同时间，按 tag 名称升序以保证确定性
             return tagsWithDate
-                .sort((a, b) => b.date - a.date)
-                .slice(0, 50)
+                .sort((a, b) => {
+                    const diff = b.date.getTime() - a.date.getTime();
+                    if (diff !== 0) return diff;
+                    return a.tag.localeCompare(b.tag);
+                })
                 .map(item => item.tag);
         } catch (error) {
             MyLog.Error(`Failed to get tags: ${error.message}`);
@@ -575,8 +580,8 @@ class GitCommandApi {
     /**
      * 获取指定路径的提交日志导出
      * @param {*} repo_url 
-     * @param {*} start_rev 
-     * @param {*} end_rev 
+     * @param {*} start_rev 起始版本号，不包含该版本
+     * @param {*} end_rev 结束版本号，不包含该版本
      * @returns 返回的日志格式为 [{revision, author, date, msg, files: [{action, path, kind, text_mods, prop_mods, copy_from}]}]
      * action: A-添加，M-修改，D-删除
      * path: 文件路径，需要带上branchtype和branch信息，以/开头
@@ -591,30 +596,44 @@ class GitCommandApi {
         MyLog.Info('get log of: ' + repo_url);
         let range = "";
         let only_self = '';
-        if(start_rev && end_rev){
-            range = `origin/${start_rev}..origin/${end_rev}`;
-        }else{
+        let limit = 100;
+        let gitLogTarget = '';
+
+        if (start_rev && end_rev) {
+            // explicit start..end range
+            range = `${start_rev}..${end_rev}`;
+            gitLogTarget = range;
+        } else if (!start_rev && end_rev) {
+            // use end_rev^ as the starting point for git log -n 50
+            gitLogTarget = `${end_rev}~1`;
+        } else {
             // 如果为分支，则增加与master的比较参数
-            if(branchType == 'branches'){
+            if (branchType == 'branches') {
                 var parent_branch = 'master';
                 // 如果分支名包含_rf_, 则 parent_branch为分支名去掉_rf_后的部分, 需要确认分支parent_branch是否存在
-                if(branch.includes('_rf_')){
+                if (branch.includes('_rf_')) {
                     parent_branch = branch.split('_rf_')[0];
                     // 如果parent_branch不存在，则设置为master
                     const branches = await this._GetBranches();
-                    if(!branches.includes(parent_branch)){
+                    if (!branches.includes(parent_branch)) {
                         parent_branch = 'master';
                     }
                 }
                 range = `origin/${parent_branch}..origin/${branch}`;
+                gitLogTarget = range;
+            } else {
+                // default target is the branch head
+                gitLogTarget = `origin/${branch}`;
             }
             only_self = '--first-parent';
         }
-        // 需要考虑文件路径为空的情况
-        if(filePath == ''){
-            var res = await this._GetGitCommandResult(`log ${range} ${only_self} -100 --pretty=format:"%H|%an|%ad|%s" --date=iso origin/${branch}`);
-        }else{
-            var res = await this._GetGitCommandResult(`log ${range} ${only_self} -100 --pretty=format:"%H|%an|%ad|%s" --date=iso origin/${branch} -- ${filePath}`);
+
+        // 构建并执行 git log 命令
+        const pretty = `--pretty=format:"%H|%an|%ad|%s"`;
+        if (filePath == '') {
+            var res = await this._GetGitCommandResult(`log ${gitLogTarget} ${only_self} -${limit} ${pretty} --date=iso`);
+        } else {
+            var res = await this._GetGitCommandResult(`log ${gitLogTarget} ${only_self} -${limit} ${pretty} --date=iso -- ${filePath}`);
         }
         let logs = await Promise.all(res.split('\n').map(async line => {
             // 如果line为空，则直接返回

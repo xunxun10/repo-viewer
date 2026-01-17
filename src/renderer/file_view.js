@@ -3,9 +3,48 @@
 function UpdateRepoFiles(repo_tree) {
     // 在repo-files中显示所有文件
     // 初始渲染
+    gv.show_dirs = repo_tree.dirs || [];
     gv.show_files = repo_tree.files;
     $(".sortable").removeClass("ascending descending");
+    // gv.gv_select_node为当前在左侧树中选中的节点id
+    renderDirs(gv.show_dirs, gv.gv_select_node_id);
     renderFiles(gv.show_files);
+}
+
+/**
+ * 渲染目录列表（显示在文件列表上方）
+ * @param {*} dirs 格式类似[{text: 'dir1', date:'<date>'}, {text: 'dir2', date:'<date>'}]
+ * @returns 
+ */
+function renderDirs(dirs, select_node_id=null) {
+    if(!dirs || dirs.length === 0){
+        $('#repo-dir-list').empty();
+        return;
+    }
+    var dirHtml = '';
+    const base = _GetSelPath();
+    dirs.forEach(function(d){
+        const full = base + '/' + d.text;
+        //前置图标表示目录
+        dirHtml += `<div class='repo-dir click-node' tabindex='0' data-full='${full}' node-text='${d.text}'>
+            <span class='item-icon dir-icon'>📁</span>
+            <span class='file-name'>${d.text}</span>
+            <span class='file-size'></span>
+            <span class='file-revision'></span>
+            <span class='file-author'></span>
+            <span class='file-date'>${d.date || ''}</span>
+        </div>`;
+    });
+    // 插入到dir list
+    $('#repo-dir-list').html(dirHtml);
+
+    // 点击目录时在左侧树中展开对应节点
+    $("#repo-dir-list").off('click', '.repo-dir').on('click', '.repo-dir', function(e){
+        e.stopPropagation();
+        const dir_name = $(this).attr('node-text');
+        const dir_node = GetTreeChildNode(dir_name, select_node_id);
+        TriggerTreeNodeClick(dir_node ? dir_node.id : null);
+    });
 }
 
 // 渲染文件列表
@@ -75,6 +114,7 @@ function renderFiles(files) {
     let fileHtml = '';
     for (var i = 0; i < files.length; i++) {
         fileHtml += `<div class='repo-file click-node' tabindex='0'>
+            <span class='item-icon file-icon'>📄</span>
             <span class='file-name'>${files[i].text}</span>
             <span class='file-size'>${files[i].size}</span>
             <span class='file-revision'>${files[i].revision}</span>

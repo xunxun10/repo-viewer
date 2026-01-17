@@ -87,8 +87,7 @@ body {
     width:calc(100% - 365px);
     border-radius: 3px;
 }
-.repo-file, .repo-file-head{
-    margin-left: 5px;
+.repo-dir,.repo-file, .repo-file-head{
     line-height: 22px;
 }
 .title-div{
@@ -109,6 +108,9 @@ body {
     width: 150px;
 }
 .file-name{
+    width: calc(100% - 440px);
+}
+.repo-file-head .file-name{
     width: calc(100% - 420px);
 }
 .click-node.active{
@@ -325,6 +327,17 @@ tr,th,td{
     padding: 5px 5px;
     font-size: 13px;
     border-radius: 4px;
+}
+#log-msgs-container pre{
+    margin: 0px;
+    border: none;
+    background-color: inherit;
+    padding: 0px;
+}
+
+#log-operation{
+    margin-top: 8px;
+    text-align: right;
 }
 
 /* 提交对应的修改文件列表对话框 */

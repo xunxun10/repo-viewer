@@ -24,7 +24,7 @@ class SvnCommandApi{
         this.password = password;
 
         this.os_type = os_type;
-        MyLog.Info(`svn command api init, repo: ${repo_url}, os type:${this.os_type}`);
+        MyLog.Info(`svn command api init, repo: ${repo_url}, fixed_version: ${this.svn_version}, os type:${this.os_type}`);
     }
 
     GetCacheStatus(){
@@ -65,7 +65,7 @@ class SvnCommandApi{
             }
             // 密码暴露在命令行中容易泄露，后续需要择期优化
             var cmd_str = `${svn_exe} --non-interactive --trust-server-cert --username ${this.user} --password ${this.password} ${cmd_params}`;
-            // var cmd_str = `${svn_exe} ${cmd_params} --non-interactive --trust-server-cert --username ${this.user}`;
+            MyLog.Debug('exec cmd: ' + cmd_str, true);
             // 注意设置缓冲区大小最大为100MB，否则读取大文件时会报错：stdout maxBuffer length exceeded
             exec(cmd_str, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
                 if(error){
@@ -206,6 +206,14 @@ class SvnCommandApi{
         return res_obj;
     }
 
+    /**
+     * 刷新数据，由于svn不使用缓存机制，因此直接返回即可
+     * @param {*} repo_url 
+     */
+    async RefreshRepoTree(repo_url){
+        return;
+    }
+
     async GetRepoFileContent(file_url, version=null){
         if(this.svn_version && version === null){
             file_url += this.svn_version;
@@ -239,18 +247,39 @@ class SvnCommandApi{
         return res;
     }
 
-    // 获取提交日志及每次提交涉及的文件列表
+    /**
+     * 获取提交日志及每次提交涉及的文件列表
+     * @param {*} repo_url 
+     * @param {*} start_rev 起始版本号，不包含该版本
+     * @param {*} end_rev 结束版本号，不包含该版本
+     * @returns 
+     */
     async GetRepoLog(repo_url, start_rev=null, end_rev=null){
         if(this.svn_version){
             repo_url += this.svn_version;
         }
         MyLog.Info('get log of: ' + repo_url)
 
-        let ver_str = '', limit_str='';
+        let ver_str = '', limit_str='', limit_num = 50;
         if (start_rev && end_rev){
-            ver_str = `-r ${start_rev}:${end_rev}`;
+            end_rev = parseInt(end_rev) - 1;
+            start_rev = parseInt(start_rev) + 1;
+            if (start_rev >= end_rev){
+                return [];
+            }
+            ver_str = `-r ${end_rev}:${start_rev}`;
+        }else if(!start_rev && end_rev){
+            end_rev = parseInt(end_rev) - 1;
+            start_rev = end_rev - 1 - limit_num;
+            if(start_rev < 0){
+                start_rev = 0;
+            }
+            if (start_rev == 0 && end_rev == 0){
+                return [];
+            }
+            ver_str = `-r ${end_rev}:${start_rev}`;
         }else{
-            limit_str = '--limit 50';
+            limit_str = `--limit ${limit_num}`;
         }
         let cmd_params = `log ${repo_url} ${ver_str} ${limit_str} --stop-on-copy --xml -v`;
         let res = await this._GetSvnCommandResult(cmd_params).catch(SvnCommandApi._ProcessCommandError);
