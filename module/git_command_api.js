@@ -163,8 +163,8 @@ class GitCommandApi {
             const lastUpdateTime = new Date(lastUpdateContent);
             const now = new Date();
             const diffMinutes = (now - lastUpdateTime) / (1000 * 60);
-            // 如果距离上次更新时间小于120分钟，则不更新
-            if (diffMinutes <= 120) {
+            // 如果距离上次更新时间小于7天（10080分钟），则不更新
+            if (diffMinutes <= 10080) {
                 shouldFetch = false;
                 if (!this._cache_status.up_time){
                     this._cache_status.up_time = lastUpdateContent;
@@ -217,7 +217,7 @@ class GitCommandApi {
                     await this._GetGitCommandResult(`checkout ${branch}`);
                 } else {
                     await this._GetGitCommandResult(`checkout ${branch}`);
-                    await this._GetGitCommandResult(`pull --rebase`);
+                    await this._GetGitCommandResult(`rebase origin/${branch}`);
                 }
                 fs.writeFileSync(lastBrFile, branch);
                 this._cache_status.br_name = branch;
@@ -327,7 +327,7 @@ class GitCommandApi {
         if(filePath == ''){
             var res = await this._GetGitCommandResult(`ls-tree --abbrev=7 ${branch}`);
         }else{
-            var res = await this._GetGitCommandResult(`ls-tree --abbrev=7 ${branch} ${filePath}/`);
+            var res = await this._GetGitCommandResult(`ls-tree --abbrev=7 ${branch} "${filePath}/"`);
         }
         let lines = res.split('\n').filter(line => line);
         let tree = { dirs: [], files: [] };
@@ -358,7 +358,7 @@ class GitCommandApi {
                 continue;
             }
             try {
-                let logPromise = this._GetGitCommandResult(`log -1 --pretty=format:"%an|%ad" --date=iso -- ${full_path}`);
+                let logPromise = this._GetGitCommandResult(`log -1 --pretty=format:"%an|%ad" --date=iso -- "${full_path}"`);
                 let sizePromise = this._GetGitCommandResult(`cat-file -s ${file.revision}`);
 
                 let [logRes, sizeRes] = await Promise.all([logPromise, sizePromise]);
@@ -544,11 +544,11 @@ class GitCommandApi {
         const version_ref = version ? version : 'HEAD';
         if (version_ref === 'HEAD') {
             // If HEAD, we can use the file directly
-            await this._GetGitCommandResult(`cat-file blob ${version_ref}:${filePath} > "${dest_path}"`);
+            await this._GetGitCommandResult(`cat-file blob ${version_ref}:"${filePath}" > "${dest_path}"`);
             return dest_path;
         }else{
             // First, get the object hash
-            const object_hash = await this._GetGitCommandResult(`rev-parse ${version_ref}:${filePath}`);
+            const object_hash = await this._GetGitCommandResult(`rev-parse ${version_ref}:"${filePath}"`);
             // Then use git cat-file to write to a temporary location
             await this._GetGitCommandResult(`cat-file blob ${object_hash.trim()} > "${dest_path}"`);
             return dest_path;
@@ -633,7 +633,7 @@ class GitCommandApi {
         if (filePath == '') {
             var res = await this._GetGitCommandResult(`log ${gitLogTarget} ${only_self} -${limit} ${pretty} --date=iso`);
         } else {
-            var res = await this._GetGitCommandResult(`log ${gitLogTarget} ${only_self} -${limit} ${pretty} --date=iso -- ${filePath}`);
+            var res = await this._GetGitCommandResult(`log ${gitLogTarget} ${only_self} -${limit} ${pretty} --date=iso -- "${filePath}"`);
         }
         let logs = await Promise.all(res.split('\n').map(async line => {
             // 如果line为空，则直接返回
@@ -833,6 +833,11 @@ class GitCommandApi {
     async _GetSubmodulePath(){
         let submodule_path_dict = {};
         try {
+            const gitmodulesPath = path.join(this.repo_path, '.gitmodules');
+            if (!fs.existsSync(gitmodulesPath)) {
+                return submodule_path_dict;
+            }
+
             // 使用 git submodule status 获取子模块状态
             const result = await this._GetGitCommandResult('submodule status', this.repo_path, false);
             if (!result || !result.trim()) {

@@ -2,6 +2,7 @@
 
 const { app, BrowserWindow, Menu, ipcMain, dialog } = require('electron')
 const { spawn } = require('child_process');
+const fs = require('fs')
 const path = require('path')
 const si = require('systeminformation');
 const crypto = require('crypto');
@@ -12,6 +13,7 @@ const MyFile = require('./util/my_file')
 const {MyDate} = require('./util/my_util')
 const MyLog = require('./util/my_log')
 const MyOs = require('./util/my_os')
+const MyActionLog = require('./util/my_action_log')
 
 const is_mac = process.platform === 'darwin'
 const is_windows = process.platform === 'win32';
@@ -51,6 +53,42 @@ var g_sys_params = {
 
 var viewer_db = new ViewerDb();
 
+// 调度器锁相关
+const LOCK_HEARTBEAT_INTERVAL = 3600000;  // 心跳间隔一小时
+const LOCK_STALE_TIMEOUT = 7200000;      // 锁超时2小时
+var g_scheduler_lock = false;
+var g_heartbeat_timer = null;
+
+// 更新窗口标题，包含仓库信息
+function UpdateWindowTitle(repo_name = null) {
+    let base_title = "RepoViewer";
+    let title = base_title;
+    
+    if (repo_name && repo_name.trim()) {
+        // 提取仓库名称（去除.git后缀和URL路径）
+        let clean_name = repo_name;
+        if (clean_name.endsWith('.git')) {
+            clean_name = clean_name.substring(0, clean_name.length - 4);
+        }
+        // 提取最后的仓库名
+        let parts = clean_name.split('/');
+        let repo_short_name = parts[parts.length - 1];
+        title = `${repo_short_name} - ${base_title}`;
+    }
+    
+    if (G_MAIN_WINDOW) {
+        MyLog.logger.debug(`update window title: ${title}`);
+        G_MAIN_WINDOW.setTitle(title);
+    }
+}
+
+// 清除窗口标题中的仓库信息
+function ClearWindowTitle() {
+    if (G_MAIN_WINDOW) {
+        G_MAIN_WINDOW.setTitle("RepoViewer");
+    }
+}
+
 // 菜单详情
 function CreateMenu(){
     return Menu.buildFromTemplate([
@@ -71,6 +109,10 @@ function CreateMenu(){
             {
                 label: 'open settings',
                 click: OpenSettings,
+            },
+            {
+                label: 'view action logs',
+                click: () => { CallWeb('show-action-logs', MyActionLog.GetLines(100)); },
             },
           ]
         },
@@ -116,6 +158,10 @@ function Init(){
     MyFile.MkDir(g_sys_params.tmp_dir);
 
     g_sys_params.ide_cmd = g_conf.GetOrSet('ide_cmd', '');
+    g_sys_params.daily_update_time = g_conf.GetOrSet('daily_update_time', '06:00');
+    g_sys_params.daily_update_count = parseInt(g_conf.GetOrSet('daily_update_count', 6), 10);
+
+    MyActionLog.Init(path.join(g_sys_params.local_data_dir, 'logs'));
 
     //_GenEncrypPassword();
 }
@@ -149,6 +195,7 @@ const createWindow = () => {
       height: 800,
       backgroundColor: '#f0f0f0', // 设置窗口背景色,不生效
       icon: icon_path,
+      title: "RepoViewer", // 设置默认窗口标题
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
         nodeIntegration: false,      // 禁用node.js以使用jquery,为了安全也最好不要打开
@@ -198,6 +245,9 @@ app.whenReady().then(() => {
     // 监听渲染器到后台事件
     ipcMain.on('send-to-bgsys', HandleWebMsg)
 
+    // 启动后台定时任务
+    _InitScheduler();
+
     // TODO:remove this, 不知为何失效
     // G_MAIN_WINDOW.webContents.openDevTools();
 })
@@ -206,6 +256,11 @@ app.whenReady().then(() => {
 app.on('activate', () => G_MAIN_WINDOW.show()) // mac点击程序坞显示窗口
 app.on('before-quit', () => {
     G_CAN_APP_EXIST = true
+    if (g_heartbeat_timer) {
+        clearInterval(g_heartbeat_timer);
+        g_heartbeat_timer = null;
+    }
+    _ReleaseLock();
 })
 // 应用关闭时
 app.on('window-all-closed', () => {
@@ -243,20 +298,25 @@ function CallWeb(type, data=null){
 }
 
 // ==================================================== 逻辑功能函数 ====================================================
-async function SetLastRepo(repo_url){
+async function SetLastRepo(repo_root){
     // 保存最后访问的仓库到访问列表
-    g_conf.Set('last_repo', repo_url)
+    g_conf.Set('last_repo', repo_root)
     // 注意此处的repo_url不包含版本号
-    if(await viewer_db.AddAccessedRepo(repo_url)){
+    if(await viewer_db.AddAccessedRepo(repo_root)){
         CallWeb('init-accessed-repo-list', await viewer_db.GetAccessedRepos());
     }
+    // 记录仓库访问时间用于频率统计
+    await viewer_db.AddRepoAccessRecord(repo_root);
+    // 更新窗口标题显示当前仓库
+    UpdateWindowTitle(repo_root);
 }
 /**
- * 使用新的仓库地址刷新前端界面仓库树
+ * 使用新的仓库地址刷新前端界面仓库树,更新树或者树节点都会访问此函数
  * @param {string} repo_url 仓库地址，如果不传则使用上次访问的仓库地址
  * @param {boolean} init_flag 是否为初始化标志，如果为true，则会进行一些初始化动作，如重置viewer实例并设置当前仓库查看器等
  */
 async function RefreshRepoTree(repo_url=null, init_flag=false){
+    let first_access = false;
     if(g_sys_params.user && g_sys_params.password){
         if(!g_sys_params.cur_repo_viewer || init_flag){
             // 首次访问时设置仓库查看器
@@ -265,6 +325,7 @@ async function RefreshRepoTree(repo_url=null, init_flag=false){
             }else{
                 var viewer_repo_url = repo_url;
             }
+            first_access = true;
             g_sys_params.cur_repo_viewer = new RepoViewer(viewer_repo_url, g_sys_params.user, 
                 g_sys_params.password, os_type, g_sys_params.repo_cache_dir);
         }
@@ -275,9 +336,16 @@ async function RefreshRepoTree(repo_url=null, init_flag=false){
         }
         let repo_tree = await g_sys_params.cur_repo_viewer.Api().GetRepoTree(repo_url);
         CallWeb('show-repo-tree', {url: repo_tree.url, tree: repo_tree});
+        
+        // 更新窗口标题，显示当前仓库信息
+        let repo_root = g_sys_params.cur_repo_viewer.Api().GetRepoRoot(repo_tree.url);
+        
         // 如果需要记录最后访问的仓库，则将其保存到后台
         if(init_flag && repo_url){
-            SetLastRepo(g_sys_params.cur_repo_viewer.Api().GetRepoRoot(repo_url));
+            // 更换仓库时，需要更新最后访问的仓库地址
+            SetLastRepo(repo_root);
+        }else if(first_access){
+            UpdateWindowTitle(repo_root);
         }
         ShowCacheStatus();
     }
@@ -356,7 +424,7 @@ function HandleWebMsg(event, msg){
             },
             "get-last-repo-tree":function(v){
                 // 检查是否设置了密码，如果没有，提示设置密码
-                if(!g_sys_params.user || ! g_sys_params.password){
+                if(!g_sys_params.user){
                     CallWeb('open-password-panel')
                     return
                 }
@@ -364,7 +432,7 @@ function HandleWebMsg(event, msg){
             },
             "get-repo-tree":function(v){
                 // 初始化仓库数据
-                if(!g_sys_params.user || ! g_sys_params.password){
+                if(!g_sys_params.user){
                     CallWeb('open-password-panel')
                     return
                 }
@@ -426,7 +494,10 @@ function HandleWebMsg(event, msg){
             'refresh-repo':function(v){
                 g_sys_params.cur_repo_viewer.Api().RefreshRepoTree(v);
                 ShowCacheStatus();
-            }
+            },
+            'get-action-logs':function(v){
+                CallWeb('show-action-logs', MyActionLog.GetLines(v || 100));
+            },
         }
         ProcessWebCall[msg.type](value);
     } catch (error) {
@@ -455,5 +526,182 @@ function OpenSettings() {
         value: g_sys_params.repo_cache_dir,
         help: 'Directory to cache repository files, default is: ' + path.join(g_sys_params.local_data_dir, 'repo_cache'),
     },
+    {
+        name: 'daily_update_time',
+        desc: 'Daily Update Time',
+        value: g_sys_params.daily_update_time,
+        help: 'Daily auto update time, format HH:mm (24-hour), default: 06:00',
+    },
+    {
+        name: 'daily_update_count',
+        desc: 'Daily Update Count',
+        value: g_sys_params.daily_update_count,
+        help: 'Number of frequently used repos to update daily, default: 6',
+    },
     ]);
+}
+
+// ==================================================== 后台定时任务 ====================================================
+
+async function RunDailyUpdate() {
+    // 锁检查：只有持有调度器锁的实例才执行更新
+    if (!g_scheduler_lock) {
+        if (_TryAcquireLock()) {
+            g_scheduler_lock = true;
+            g_heartbeat_timer = setInterval(_UpdateHeartbeat, LOCK_HEARTBEAT_INTERVAL);
+            MyLog.Info('This instance took over scheduler lock');
+            MyActionLog.Add('This instance took over scheduler lock', 'info');
+        } else {
+            MyLog.Info('Skipping daily update: scheduler lock held by another instance');
+            return;
+        }
+    }
+
+    _UpdateHeartbeat();
+
+    if (!g_sys_params.user) {
+        MyLog.Info('Daily update skipped: no user/password configured');
+        return;
+    }
+
+    // 清理过期的访问记录
+    await viewer_db.CleanupRepoAccess();
+
+    const taskId = `daily-${Date.now()}`;
+    MyLog.Info(`[${taskId}] Starting daily repo update task...`);
+    SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Starting daily repo update...`);
+    MyActionLog.Add(`[${taskId}] Starting daily repo update...`, 'info');
+
+    try {
+        const repoCount = g_sys_params.daily_update_count > 0 ? g_sys_params.daily_update_count : 6;
+        const repos = await viewer_db.GetFrequentlyUsedRepos(15, repoCount, 'git');
+        if (repos.length === 0) {
+            const msg = `[${taskId}] No repos with access records found, skipping update`;
+            MyLog.Info(msg);
+            MyActionLog.Add(msg, 'info');
+            SendInfoToWeb(msg);
+            return;
+        }
+
+        MyLog.Info(`[${taskId}] Found ${repos.length} repos to update: ${JSON.stringify(repos)}`);
+        SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Daily update: updating ${repos.length} repos...`);
+
+        for (const repo_url of repos) {
+            try {
+                MyLog.Info(`[${taskId}] Updating repo: ${repo_url}`);
+                SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Updating repo: ${repo_url}`);
+
+                const viewer = new RepoViewer(repo_url, g_sys_params.user, g_sys_params.password, os_type, g_sys_params.repo_cache_dir);
+                await viewer.Api().GetRepoTree(repo_url);
+
+                MyActionLog.Add(`[${taskId}] Updated repo: ${repo_url}`, 'info');
+                MyLog.Info(`[${taskId}] Successfully updated repo: ${repo_url}`);
+            } catch (e) {
+                const errMsg = `[${taskId}] Failed to update repo: ${repo_url}, error: ${e.message}`;
+                MyLog.Error(errMsg);
+                MyActionLog.Add(errMsg, 'error');
+                SendInfoToWeb(errMsg);
+            }
+        }
+
+        const completeMsg = `[${taskId}] Daily repo update completed, updated ${repos.length} repos`;
+        MyLog.Info(completeMsg);
+        MyActionLog.Add(completeMsg, 'info');
+        SendInfoToWeb(completeMsg);
+    } catch (e) {
+        const errMsg = `[${taskId}] Daily update error: ${e.message}`;
+        MyLog.Error(errMsg);
+        MyActionLog.Add(errMsg, 'error');
+        SendInfoToWeb(errMsg);
+    }
+}
+
+function ScheduleDailyUpdate() {
+    const parts = (g_sys_params.daily_update_time || '06:00').split(':');
+    const hour = parseInt(parts[0], 10) || 6;
+    const minute = parseInt(parts[1], 10) || 0;
+
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(hour, minute, 0, 0);
+    if (next <= now) {
+        next.setDate(next.getDate() + 1);
+    }
+    const msUntilNext = next - now;
+
+    var nextTimeStr = MyDate.GetDateStr(next, true);
+    MyLog.Info(`Daily update scheduled, next run at ${nextTimeStr}`);
+    MyActionLog.Add(`Daily update scheduled, next run at ${nextTimeStr}`, 'info');
+
+    setTimeout(() => {
+        RunDailyUpdate().then(() => {
+            setInterval(RunDailyUpdate, 24 * 60 * 60 * 1000);
+        });
+    }, msUntilNext);
+}
+
+// ==================================================== 调度器锁管理 ====================================================
+
+function _LockFilePath() {
+    return path.join(g_sys_params.local_data_dir, 'scheduler.lock');
+}
+
+function _TryAcquireLock() {
+    const lockFile = _LockFilePath();
+    try {
+        if (fs.existsSync(lockFile)) {
+            const content = fs.readFileSync(lockFile, 'utf-8');
+            const data = JSON.parse(content);
+            const elapsed = Date.now() - (data.heartbeat || 0);
+            if (elapsed < LOCK_STALE_TIMEOUT) {
+                MyLog.Debug(`Scheduler lock held by pid ${data.pid}, heartbeat ${elapsed}ms ago`);
+                return false;
+            }
+            MyLog.Warn(`Found stale scheduler lock (pid ${data.pid}, ${elapsed}ms stale), taking over`);
+        }
+        fs.writeFileSync(lockFile, JSON.stringify({
+            pid: process.pid,
+            heartbeat: Date.now(),
+        }), 'utf-8');
+        return true;
+    } catch (e) {
+        MyLog.Warn(`Failed to acquire scheduler lock: ${e && e.message ? e.message : e}`);
+        return false;
+    }
+}
+
+function _ReleaseLock() {
+    try {
+        const lockFile = _LockFilePath();
+        if (fs.existsSync(lockFile)) {
+            const content = fs.readFileSync(lockFile, 'utf-8');
+            const data = JSON.parse(content);
+            if (data.pid === process.pid) {
+                fs.unlinkSync(lockFile);
+            }
+        }
+    } catch (e) {}
+}
+
+function _UpdateHeartbeat() {
+    if (!g_scheduler_lock) return;
+    try {
+        const lockFile = _LockFilePath();
+        const content = fs.readFileSync(lockFile, 'utf-8');
+        const data = JSON.parse(content);
+        data.heartbeat = Date.now();
+        fs.writeFileSync(lockFile, JSON.stringify(data), 'utf-8');
+    } catch (e) {}
+}
+
+function _InitScheduler() {
+    if (_TryAcquireLock()) {
+        g_scheduler_lock = true;
+        MyLog.Info('This instance acquired scheduler lock');
+        MyActionLog.Add('This instance acquired scheduler lock and will manage daily updates', 'info');
+        g_heartbeat_timer = setInterval(_UpdateHeartbeat, LOCK_HEARTBEAT_INTERVAL);
+    } else {
+        MyLog.Info('Scheduler lock held by another instance, will check again at run time');
+    }
+    ScheduleDailyUpdate();
 }

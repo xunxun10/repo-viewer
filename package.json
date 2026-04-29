@@ -1,6 +1,6 @@
 {
   "name": "repo-viewer",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "源码仓库浏览器",
   "main": "main.js",
   "scripts": {
@@ -30,6 +30,10 @@
     "winston": "^3.9.0"
   },
   "build": {
+    "appId": "com.repo-viewer.xunxun10",
+    "directories": {
+      "output": "dist"
+    },
     "nsis": {
       "shortcutName": "repoviewer",
       "oneClick": false,

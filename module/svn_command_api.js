@@ -64,7 +64,8 @@ class SvnCommandApi{
                 var svn_exe = 'svn';
             }
             // 密码暴露在命令行中容易泄露，后续需要择期优化
-            var cmd_str = `${svn_exe} --non-interactive --trust-server-cert --username ${this.user} --password ${this.password} ${cmd_params}`;
+            var auth_part = this.password ? `--username ${this.user} --password ${this.password}` : '';
+            var cmd_str = `${svn_exe} --non-interactive --trust-server-cert ${auth_part} ${cmd_params}`;
             MyLog.Debug('exec cmd: ' + cmd_str, true);
             // 注意设置缓冲区大小最大为100MB，否则读取大文件时会报错：stdout maxBuffer length exceeded
             exec(cmd_str, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
@@ -181,7 +182,7 @@ class SvnCommandApi{
             repo_url += this.svn_version;
         }
 
-        let res = await this._GetSvnCommandResult(`list ${repo_url} --xml`).catch(SvnCommandApi._ProcessCommandError);
+        let res = await this._GetSvnCommandResult(`list "${repo_url}" --xml`).catch(SvnCommandApi._ProcessCommandError);
         let res_obj = SvnCommandApi._ParseRepoTree(res);
         res_obj.url = repo_url;
 
@@ -225,7 +226,7 @@ class SvnCommandApi{
             des_url = `${des_url}@${version}`;
         }
 
-        let res = await this._GetSvnCommandResult(`cat ${des_url}`).catch(SvnCommandApi._ProcessCommandError);
+        let res = await this._GetSvnCommandResult(`cat "${des_url}"`).catch(SvnCommandApi._ProcessCommandError);
         // console.log(res.data);  // debug console
         return res;
     }
@@ -242,7 +243,7 @@ class SvnCommandApi{
             des_url = `${des_url}@${version}`;
         }
 
-        let res = await this._GetSvnCommandResult(`export --force ${des_url} ${dest_path}`).catch(SvnCommandApi._ProcessCommandError);
+        let res = await this._GetSvnCommandResult(`export --force "${des_url}" "${dest_path}"`).catch(SvnCommandApi._ProcessCommandError);
         // console.log(res.data);  // debug console
         return res;
     }
@@ -281,7 +282,7 @@ class SvnCommandApi{
         }else{
             limit_str = `--limit ${limit_num}`;
         }
-        let cmd_params = `log ${repo_url} ${ver_str} ${limit_str} --stop-on-copy --xml -v`;
+        let cmd_params = `log "${repo_url}" ${ver_str} ${limit_str} --stop-on-copy --xml -v`;
         let res = await this._GetSvnCommandResult(cmd_params).catch(SvnCommandApi._ProcessCommandError);
         // console.log(res);  // debug console
 
@@ -352,7 +353,7 @@ class SvnCommandApi{
             des_url = `${file_url}@${version}`;
         }
 
-        let res = await this._GetSvnCommandResult(`proplist -v ${des_url} --xml`).catch(SvnCommandApi._ProcessCommandError);
+        let res = await this._GetSvnCommandResult(`proplist -v "${des_url}" --xml`).catch(SvnCommandApi._ProcessCommandError);
         /**
          * 返回数据结构如下：
         <properties>

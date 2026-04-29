@@ -90,6 +90,9 @@ if(typeof window.electronAPI != 'undefined'){
             "show-repo-properties-diff":function(v){
                 ShowDiff(v.pre, v.new, v.title);
             },
+            "show-action-logs":function(v){
+                ShowActionLogs(v);
+            },
         }
         ProcessSysCall[msg.type](value);
     })
@@ -115,13 +118,15 @@ function ShowStatus(str){
     if(str){
         $('#bottom-status').text(str);
     }else{
-        // 将 2025-03-22T14:51:55.776Z 格式时间转换为localtime
         var time = '';
+        var branch = g_status.br_name;
         if(g_status.up_time){
             var date = new Date(g_status.up_time);
-            var time = MyDate.GetTime4Str(date);
+            var time = MyDate.GetDateStr(date, true);
+            var maxBrLen = 45 - time.length;
+            branch = branch.slice(0, maxBrLen);
         }
-        $('#bottom-status').text(`${time} ${g_status.br_name.slice(0,38)}`);
+        $('#bottom-status').text(`${time} ${branch}`);
     }
 }
 
@@ -179,55 +184,234 @@ function UpdateRepoUrl(repo_url){
     }
 }
 
-
-function ShowDiff(pre_content, cur_content, title="Diff"){
+/**
+ * 显示笔记差异
+ * @param {*} pre_content 前一个版本的内容
+ * @param {*} cur_content 当前版本的内容
+ * @param {*} diff_mode 差异模式，line表示按行对比，word表示按单词对比，char表示按字符对比，默认按行对比
+ */
+function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line'){
     var color = '', span = null;
 
-    var display = $("<pre id='diff-info'></pre>");
+    // 如果内容相同则弹框提示
+    if(pre_content === cur_content){
+        MyModal.Alert("内容相同，无差异");
+        return;
+    }
 
-    //var diff = Diff.diffChars(pre_content, cur_content);
-    //var diff = Diff.diffWords(pre_content, cur_content);
-    var diff = Diff.diffLines(pre_content, cur_content);
-    var fragment = document.createDocumentFragment();
-    
-    diff.forEach(function(part){
-        // green for additions, red for deletions, grey for common parts
-        color = part.added ? 'green' : part.removed ? 'red' : '';
-        span = document.createElement('span');
-        if(color == ''){
-            span.appendChild(document.createTextNode(part.value));
-        }else{
-            // 设置class
-            span.className = 'diff-span ' + color;
-            // 设置内容，需要注意对换行符进行处理，避免显示不出来，替换为span
-            var lines = part.value.split(/\r?\n/);
-            for(var i = 0; i < lines.length; i++){
-                var cur_line = lines[i];
-                if(cur_line == ''){  // 空行
-                    // 最后一行不能加
-                    if(i >= lines.length-1){
-                        break;
-                    }
-                    var zwc_ele = document.createElement("span");
-                    zwc_ele.className = 'diff-line-break';
-                    span.appendChild(zwc_ele);
-                }else{
-                    span.appendChild(document.createTextNode(cur_line));
-                }
-                if(i < lines.length-1){
-                    span.appendChild(document.createTextNode('\n'));
-                }
+    // 使用可滚动的两列布局：左侧行为行号，右侧为内容；整体容器保留 id='diff-info' 以兼容滚动/跳转逻辑
+    var display = $("<div id='diff-info' class='diff-view'></div>");
+    var gutter = document.createElement('div');
+    gutter.className = 'diff-gutter';
+    var content = document.createElement('div');
+    content.className = 'diff-content';
+
+    // 行号计数器：针对最终版本（cur_content）所有非-removed 的行都参与计数（包括不变的数据）
+    var finalLineNo = 1;
+
+    var diff;
+    // 如果cur_content末尾不是换行符，则两边各增加一个换行符
+    if(!/^\r?\n$/.test(cur_content)){
+        pre_content += '\n';
+        cur_content += '\n';
+    }
+    if(diff_mode == 'char'){
+        diff = Diff.diffChars(pre_content, cur_content);
+    }else if(diff_mode == 'word'){
+        diff = Diff.diffWords(pre_content, cur_content);
+    }else{
+        diff = Diff.diffLines(pre_content, cur_content);
+    }
+    // 会话级保存设置（内存中），每次打开比较界面生效但不写入磁盘
+    if(typeof window._diff_saved_settings === 'undefined') window._diff_saved_settings = {};
+    var _diff_saved_settings = window._diff_saved_settings;
+
+    // render 函数：根据 filterRegexStr 与 showOnlyChanges 设置渲染内容
+    function render(filterRegexStr, showOnlyChanges, excludeRegexStr){
+        // 清空容器
+        gutter.innerHTML = '';
+        content.innerHTML = '';
+
+        // 预编译正则（如果有）
+        var re = null;
+        if(filterRegexStr && filterRegexStr.length > 0){
+            try{
+                re = new RegExp(filterRegexStr);
+            }catch(e){
+                // 如果正则非法，则忽略过滤
+                re = null;
             }
         }
-        fragment.appendChild(span);
-    });
 
-    display.append(fragment);
-    MyModal.Info(display, title, '1000px', '600px', 'diff-modal');
+        // 预编译排除正则（如果有）
+        var excludeRe = null;
+        if(excludeRegexStr && excludeRegexStr.length > 0){
+            try{
+                excludeRe = new RegExp(excludeRegexStr);
+            }catch(e){
+                // 如果正则非法，则忽略过滤
+                excludeRe = null;
+            }
+        }
+
+        // 行号计数器：针对最终版本（cur_content）所有非-removed 的行都参与计数（包括不变的数据）
+        var localFinalLineNo = 1;
+        var linePrefix = '';  // 存储同行内删除数据前的非删除内容，因为一行可能包含多个part
+
+        diff.forEach(function(part){
+            var partColor = part.added ? 'green' : part.removed ? 'red' : '';
+            var lines = part.value.split(/\r?\n/);
+            // Check if the part ends with a newline - if not, the last element in lines is not a complete line
+            var partEndsWithNewline = /\r?\n$/.test(part.value);
+            if(lines.length > 1 && partEndsWithNewline){
+                lines.pop(); // Remove the empty string after the final newline
+            }
+            var isRemoved = !!part.removed;
+
+            for(var i = 0; i < lines.length; i++){
+                var cur_line = lines[i];
+
+                // 判断当前行是否含有换行符（以换行符结束）
+                var isLineEnd = (i < lines.length - 1) || partEndsWithNewline;
+                var isEmptyLineNo =  false;
+
+                // 当前行在最终版本的行号
+                var currentLineNo = null;
+                // 删除行不显示行号，如果是删除行但linePrefix有值，也需要显示行号（linePrefix表示删除行前还有非删除的内容）
+                if(isLineEnd){
+                    if (!isRemoved || linePrefix !== ''){
+                        currentLineNo = localFinalLineNo;
+                        localFinalLineNo++;
+                    }else{
+                        isEmptyLineNo = true;
+                    }
+                }
+
+                // 过滤与"仅显示变更"判定（注意：即便被过滤，行号仍按未过滤数据计算）
+                var shouldRender = true;
+                if(re){
+                    // 对文本进行匹配（对 removed/added/unchanged 均使用该文本）
+                    shouldRender = re.test(cur_line);
+                }
+                // 排除正则过滤：满足排除正则的行不显示
+                if(excludeRe && excludeRe.test(cur_line)){
+                    shouldRender = false;
+                }
+                if(showOnlyChanges && partColor === ''){
+                    shouldRender = false;
+                }
+
+                if(!shouldRender){
+                    // 即不渲染该行，但如果是非 removed 且是完整行，则行号计数已增加
+                    continue;
+                }
+
+                if(isLineEnd){
+                    // gutter: 只有非-removed 的完整行显示行号，removed 或不完整行显示占位
+                    var gutterLine = document.createElement('div');
+                    gutterLine.className = 'diff-gutter-line';
+                    if(!isEmptyLineNo){
+                        gutterLine.appendChild(document.createTextNode(currentLineNo));
+                    }else{
+                        gutterLine.appendChild(document.createTextNode(''));
+                    }
+                    gutter.appendChild(gutterLine);
+                }
+
+                if(partColor === ''){
+                    content.appendChild(document.createTextNode(cur_line));
+                }else{
+                    var inner = document.createElement('span');
+                    inner.className = 'diff-span ' + partColor;
+                    if(cur_line === ''){
+                        var zwc_ele = document.createElement('span');
+                        zwc_ele.className = 'diff-line-break';
+                        inner.appendChild(zwc_ele);
+                    }else{
+                        inner.appendChild(document.createTextNode(cur_line));
+                    }
+                    content.appendChild(inner);
+                }
+                // Add line break after each line except for the last line in a part that doesn't end with newline
+                if(isLineEnd){
+                    content.appendChild(document.createElement('br'));
+                    linePrefix = '';
+                }else{
+                    if(!isRemoved){
+                        linePrefix += cur_line;
+                    }
+                }
+            }
+        });
+
+        // 根据最终行号计算 gutter 宽度（按数字位数估算）
+        var maxLine = Math.max(1, localFinalLineNo - 1);
+        var digits = String(maxLine).length;
+        var gutterWidth = Math.min(200, Math.max(20, digits * 8 + 7));
+
+        // 计算 gutter 高度，确保背景色和边框完整显示
+        var gutterHeight = gutter.children.length * 20 + 12; // 每行20px
+
+        // 将容器插入显示面板（如果尚未插入）
+        // `display` 是 jQuery 对象，使用其 DOM 元素进行 contains/append 操作
+        var dispEl = (display && display.length) ? display[0] : display;
+        if(dispEl && typeof dispEl.contains === 'function'){
+            if(!dispEl.contains(gutter)) dispEl.appendChild(gutter);
+            if(!dispEl.contains(content)) dispEl.appendChild(content);
+        }else{
+            // 回退到 jQuery append
+            if(display && display.append){
+                display.append(gutter);
+                display.append(content);
+            }
+        }
+
+        // 在添加到DOM后设置宽度和高度，确保样式生效
+        gutter.style.width = gutterWidth + 'px';
+        gutter.style.flex = '0 0 ' + gutterWidth + 'px'; // 设置flex属性以确保在flex容器中正确显示
+        gutter.style.height = gutterHeight + 'px';
+    }
+
+    // 首次渲染：使用已保存设置（如果有），否则显示全部
+    var initRegex = _diff_saved_settings.regex || '';
+    var initOnly = !!_diff_saved_settings.onlyChanges;
+    var initExclude = _diff_saved_settings.excludeRegex || '';
+    render(initRegex, initOnly, initExclude);
+    MyModal.Info(display, title, '1000px', '600px', 'diff');
 
     // 设置跳转到上一个及下一个变更的位置的按钮
+    var diff_btns = $("<div class='diff-btns'></div>");
+    var top_btn = $("<button class='btn btn-default diff-top-btn' title='跳转到第一个变更'><span class='glyphicon glyphicon-arrow-up'></span></button>");
     var pre_btn = $("<button class='btn btn-default diff-pre-btn' title='前一个变更'><span class='glyphicon glyphicon-chevron-up'></span></button>");
     var next_btn = $("<button class='btn btn-default diff-next-btn' title='后一个变更'><span class='glyphicon glyphicon-chevron-down'></button>");
+    // 添加拷贝之前之后的内容按钮
+    var pre_copy_btn = $("<button class='btn btn-default diff-pre-copy-btn' title='拷贝原始数据内容'><span class='glyphicon glyphicon-file'> </span></button>");
+
+    var settings_btn = $("<button class='btn btn-default diff-settings-btn' title='显示/过滤设置'><span class='glyphicon glyphicon-cog'></span></button>");
+
+    // 根据设置状态更新图标
+    function updateSettingsIcon(){
+        var hasSettings = (_diff_saved_settings.regex || '') !== '' ||
+                          (_diff_saved_settings.excludeRegex || '') !== '' ||
+                          !!_diff_saved_settings.onlyChanges;
+        var iconSpan = settings_btn.find('span');
+        if(hasSettings){
+            iconSpan.removeClass('glyphicon-cog').addClass('glyphicon-exclamation-sign');
+        }else{
+            iconSpan.removeClass('glyphicon-exclamation-sign').addClass('glyphicon-cog');
+        }
+    }
+    updateSettingsIcon();
+
+    diff_btns.append(top_btn);
+    diff_btns.append(pre_btn);
+    diff_btns.append(next_btn);
+    diff_btns.append(pre_copy_btn);
+    // 只对行模式显示settings按钮
+    if(diff_mode === 'line'){
+        diff_btns.append(settings_btn);
+    }
+
     pre_btn.click(()=>{
         var cur_span_parent = $("#diff-info");
         var cur_span_parent_scroll_top = cur_span_parent.scrollTop();
@@ -239,52 +423,97 @@ function ShowDiff(pre_content, cur_content, title="Diff"){
             // 相对于可视区域的位置
             var cur_span_top = cur_span.position().top;
             if(cur_span_top < 0){
-                var new_pos = cur_span_parent_scroll_top + cur_span_top - 30;
-                cur_span_parent.scrollTop(new_pos);
+                cur_span_parent.scrollTop(cur_span_parent_scroll_top + cur_span_top - 30);
                 find_flag = true;
                 return false;
             }
         });
         if(!find_flag){
             // 提示已无数据
-            Info("已到顶");
+            MyModal.Alert("已到顶");
         }
     });
     next_btn.click(()=>{
         var cur_span_parent = $("#diff-info");
         var cur_span_parent_scroll_top = cur_span_parent.scrollTop();
         var find_flag = false;
-        // 倒序遍历#diff-info内的span元素
+        // 顺序遍历#diff-info内的span元素
         $("#diff-info .diff-span").each(function(index, ele_dom){
             // 遍历#diff-info内的span元素，找到位于可视区域的前一个span元素
             var cur_span = $(ele_dom);
             // 相对于可视区域的位置
             var cur_span_top = cur_span.position().top;
             if(cur_span_top > 0){
-                var new_pos = cur_span_parent_scroll_top + cur_span_top - 30;
-                // 跳过当前视窗内的元素
                 if(cur_span_top < cur_span_parent.height()){
                     return; // continue
                 }
-                cur_span_parent.scrollTop(new_pos);
+                cur_span_parent.scrollTop(cur_span_parent_scroll_top + cur_span_top - 30);
                 find_flag = true;
                 return false;
             }
         });
         if(!find_flag){
             // 提示已无数据
-            Info("已到底");
+            MyModal.Alert("已到底");
         }
     });
-    display.append(pre_btn);
-    display.append(next_btn);
-
-    // 添加拷贝之前之后的内容按钮
-    var pre_copy_btn = $("<button class='btn btn-default diff-pre-copy-btn' title='拷贝旧版本数据'><span class='glyphicon glyphicon-file'> </span></button>");
-    pre_copy_btn.click(()=>{
-        MyOs.CopyTextToClipboard(pre_content);
+    top_btn.click(()=>{
+        var cur_span_parent = $("#diff-info");
+        cur_span_parent.scrollTop(0);
+        // 跳转到第一个变更
+        var first_span = $("#diff-info .diff-span").first();
+        if(first_span.length > 0){
+            var first_span_top = first_span.position().top;
+            cur_span_parent.scrollTop(first_span_top - 30);
+        }
     });
-    display.append(pre_copy_btn);
+
+    pre_copy_btn.click(()=>{
+        CopyText(pre_content);
+    });
+
+    // 设置按钮：打开弹窗，允许输入行文本过滤正则以及是否只显示变更
+    settings_btn.click(()=>{
+        // 使用已保存的默认值回显
+        var saved = _diff_saved_settings || {};
+        var savedRegex = saved.regex || '';
+        var savedOnly = saved.onlyChanges ? 'checked' : '';
+        var savedExclude = saved.excludeRegex || '';
+        var html = `
+        <div class='form-group'>
+            <label>行文本过滤正则（空为不使用）</label>
+            <input type='text' id='diff-settings-regex' class='form-control' placeholder='例如: ^ERROR' value="${savedRegex}">
+        </div>
+        <div class='form-group'>
+            <label>排除正则（满足此正则的行不显示）</label>
+            <input type='text' id='diff-settings-exclude-regex' class='form-control' placeholder='例如: ^DEBUG' value="${savedExclude}">
+        </div>
+        <div class='form-group'>
+            <label><input type='checkbox' id='diff-settings-only-changes' ${savedOnly}> 只显示变更行</label>
+        </div>`;
+        MyModal.Alert(html, function(){
+            var regexStr = $('#diff-settings-regex').val() || '';
+            var excludeRegexStr = $('#diff-settings-exclude-regex').val() || '';
+            var onlyChanges = $('#diff-settings-only-changes').is(':checked');
+            // 验证正则
+            if(regexStr){
+                try{ new RegExp(regexStr); }catch(e){ MyModal.Alert('正则表达式无效: ' + e); return; }
+            }
+            if(excludeRegexStr){
+                try{ new RegExp(excludeRegexStr); }catch(e){ MyModal.Alert('排除正则表达式无效: ' + e); return; }
+            }
+            // 保存设置到会话内存（不写入磁盘）
+            _diff_saved_settings.regex = regexStr;
+            _diff_saved_settings.excludeRegex = excludeRegexStr;
+            _diff_saved_settings.onlyChanges = onlyChanges;
+            // 更新设置图标
+            updateSettingsIcon();
+            // 重新渲染 diff（行号仍使用未过滤的计数）
+            render(regexStr, onlyChanges, excludeRegexStr);
+        }, 600, 240, 'Diff Settings');
+    });
+
+    display.append(diff_btns);
 }
 
 function ShowFileDiff(pre_content, new_content, title){
@@ -475,6 +704,33 @@ function BindFilePathCopyHotKey(ele_id){
 // 快捷键设置
 function BindHotKey(){
     BindFilePathCopyHotKey("#tree-container");
+}
+
+function ShowActionLogs(logs){
+    if (!logs || logs.length === 0) {
+        MyModal.Alert("No action logs available");
+        return;
+    }
+    var html = `<div class='action-log-container' style='max-height:400px; overflow-y:auto; font-size:12px;'>
+        <table class='table table-condensed table-striped' style='margin-bottom:0;'>
+            <thead><tr><th style='width:140px;'>Time</th><th>Level</th><th>Message</th></tr></thead>
+            <tbody>`;
+    for (var i = 0; i < logs.length; i++) {
+        var log = logs[i];
+        var time = log.create_time;
+        if (time) {
+            var d = new Date(time);
+            time = MyDate.GetDateStr(d, true);
+        }
+        var levelClass = log.level === 'error' ? 'label label-danger' : log.level === 'warn' ? 'label label-warning' : 'label label-info';
+        html += `<tr>
+            <td style='white-space:nowrap;'>${time}</td>
+            <td><span class='${levelClass}'>${log.level}</span></td>
+            <td style='word-break:break-all;'>${log.message}</td>
+        </tr>`;
+    }
+    html += `</tbody></table></div>`;
+    MyModal.Alert(html, null, 900);
 }
 
 $(function(){

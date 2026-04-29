@@ -33,16 +33,15 @@ class SvnWebApi{
     }
 
     static _CreateAxios(user, password, use_https=false){
+        let headers = {
+            Depth: '1',  // 请求目录信息深度
+            Accept: '*/*',  // 返回xml格式数据
+        };
+        if(password){
+            headers.Authorization = SvnWebApi._EncodePassword(user, password);
+        }
         let http_ops = {
-            /*auth: {
-                username: user,
-                password: password
-            },*/
-            headers: {
-                Depth: '1',  // 请求目录信息深度
-                Authorization: SvnWebApi._EncodePassword(user, password),
-                Accept: '*/*',  // 返回xml格式数据
-            },
+            headers: headers,
         }
         // TODO 如果是私人证书还要设置ca信任，这里不处理。因此目前https协议处理可能会有问题
         // 如果为https请求，需要设置agent来忽略证书异常

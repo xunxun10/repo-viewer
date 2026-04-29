@@ -24,6 +24,7 @@ class ViewerDb{
     async Init(db_file){
         this.db = new MyDb(db_file, "create table if not exists repo_viewer(id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, nickname TEXT);");
         this.db.Run('create table if not exists info(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, value TEXT);');
+        this.db.Run('create table if not exists repo_access(id INTEGER PRIMARY KEY AUTOINCREMENT, repo_url TEXT, access_time TEXT);');
 
         // 如果不存在nickname字段，则增加
         let res = await this.db.Query('PRAGMA table_info(repo_viewer)');
@@ -37,6 +38,42 @@ class ViewerDb{
         if(!has_nickname){
             await this.db.Run('alter table repo_viewer add column nickname TEXT');
         }
+    }
+
+    /**
+     * 记录仓库访问时间，用于频率统计
+     * @param {string} repo_url 
+     */
+    async AddRepoAccessRecord(repo_url) {
+        await this.db.Run('insert into repo_access(repo_url, access_time) values(?, ?)', [repo_url, new Date().toISOString()]);
+    }
+
+    /**
+     * 获取最近N天内最常用的M个仓库
+     * @param {number} days 天数，默认15天
+     * @param {number} count 返回数量，默认6个
+     * @param {string|null} repo_type 仓库类型过滤，'git'或'svn'，null为不限
+     * @returns {Array<string>} 仓库URL列表
+     */
+    async GetFrequentlyUsedRepos(days = 15, count = 6, repo_type = null) {
+        let cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+        let res = await this.db.Query(
+            'select repo_url, count(*) as freq from repo_access where access_time > ? group by repo_url order by freq desc',
+            [cutoff]
+        );
+        let repos = res.map(r => r.repo_url);
+        if (repo_type === 'git') {
+            repos = repos.filter(url => url.endsWith('.git') || url.includes('git@') || url.includes('.git/'));
+        }
+        return repos.slice(0, count);
+    }
+
+    /**
+     * 清理repo_access表中超过1年的记录
+     */
+    async CleanupRepoAccess() {
+        const cutoff = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+        await this.db.Run('delete from repo_access where access_time < ?', [cutoff]);
     }
 
     /**
