@@ -1,15 +1,16 @@
 {
   "name": "repo-viewer",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "源码仓库浏览器",
   "main": "main.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "electron .",
-    "dist": "electron-builder --win --x64",
+    "dist": "electron-builder --win --x64 --dir",
+    "dist-full": "electron-builder --win --x64",
     "arm": "electron-builder --linux --arm64"
   },
-  "author": "",
+  "author": "xunxun10",
   "license": "MIT",
   "devDependencies": {
     "electron": "^22.0.0",
@@ -18,13 +19,9 @@
   },
   "dependencies": {
     "axios": "^1.7.2",
-    "crypto": "^1.0.1",
-    "diff": "^5.1.0",
-    "diff2html": "^3.4.51",
     "fast-xml-parser": "^4.4.0",
     "fs-extra": "^11.1.1",
     "ini": "^4.1.1",
-    "jstree": "^3.3.16",
     "sqlite3": "^5.1.6",
     "systeminformation": "^5.22.11",
     "winston": "^3.9.0"
@@ -34,6 +31,17 @@
     "directories": {
       "output": "dist"
     },
+    "files": [
+      "**/*",
+      "!**/.vscode/**",
+      "!**/.trae/**",
+      "!*.sh",
+      "!*.md",
+      "!*.lock",
+      "!dist.files.md5*.txt",
+      "!change_log.txt",
+      "!.gitignore"
+    ],
     "nsis": {
       "shortcutName": "repoviewer",
       "oneClick": false,

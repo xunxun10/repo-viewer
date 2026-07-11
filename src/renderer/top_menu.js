@@ -1,18 +1,20 @@
 
-function OpenPasswordPanel(user){
+function OpenPasswordPanel(data){
     // 生成包含用户名及密码输入框的html代码
     var html = `<table class='passwrod-table settings-table'>
     <tr>
         <td>Username:</td>
-        <td><input type='text' id='user-input' class='modal-input' value="${user}"></td>
+        <td><input type='text' id='user-input' class='modal-input' value="${data.user || ''}"></td>
     </tr>
     <tr>
         <td>Password:</td>
-        <td><input type='password' id='password-input' class='modal-input'></td>
+        <td><input type='password' id='password-input' class='modal-input' value="${data.hasPwd ? '********' : ''}"></td>
     </tr>
     </table>`
     function Ok(){
-        var v = { user: $('#user-input').val(), password: $('#password-input').val() };
+        var pwd = $('#password-input').val();
+        // 如果密码输入框内容仍是占位符，则不更新密码
+        var v = { user: $('#user-input').val(), password: (pwd === '********' ? undefined : pwd) };
         CallSys('set-password', v);
     }
     MyModal.Confirm(html, Ok, null, null, "请输入SVN仓库访问用户及密码");

@@ -699,6 +699,26 @@ var MyJQueryUi = class {
 	}
 }
 
+var MyCheck = class{
+    /**
+     * 判空函数，空字符串、undefined、null、false、0、NaN 均视为空
+     * @param {*} v
+     * @returns {boolean}
+     */
+    static IsEmpty(v) {
+        if (v === false || v === undefined || v === null) {
+            return true;
+        }
+        if (typeof v === 'string' && v.trim() === '') {
+            return true;
+        }
+        if (typeof v === 'number' && (v === 0 || isNaN(v))) {
+            return true;
+        }
+        return false;
+    }
+}
+
 if(typeof module != "undefined" && typeof module.exports != "undefined"){
-    module.exports = { MyDate, MyString, MyUnit };
+    module.exports = { MyDate, MyString, MyUnit, MyCheck };
 }

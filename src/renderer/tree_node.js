@@ -66,6 +66,16 @@ function _CreateRepoTreeNode(repo){
                             $('#repo-tree').jstree('close_node', parent_node);
                         }
                     },
+                    "searchfiles": {
+                        "separator_before": true,
+                        "separator_after": false,
+                        "label": "search files",
+                        "action": function (obj) {
+                            $('.repo-file.click-node').removeClass('active');
+                            SetSelectNode(node);
+                            OpenSearchDialog(_GetSelPath());
+                        }
+                    },
                     // 每次展开都会刷新子节点信息，因此不需要刷新菜单
                     // 其他菜单项...
                 };
@@ -313,7 +323,27 @@ function UpdateRepoTree(repo){
         $('#repo-tree').jstree('destroy');
         $('#repo-tree').jstree(_CreateRepoTreeNode(repo));
         _AddRepoTreeEvent($('#repo-tree'));
+        // 首次打开 git 仓库时自动选中默认分支并展开
+        _AutoOpenDefaultBranch();
     }
+}
+
+/**
+ * 首次加载 git 仓库根节点时，自动选中默认分支（非 branches/tags 的节点）并展开
+ */
+function _AutoOpenDefaultBranch() {
+    $('#repo-tree').on('ready.jstree', function() {
+        var tree = $('#repo-tree').jstree(true);
+        if (!tree) return;
+        var children = tree.get_node('#').children;
+        for (var i = 0; i < children.length; i++) {
+            var node = tree.get_node(children[i]);
+            if (node && node.text !== 'branches' && node.text !== 'tags') {
+                $('#' + node.id + ' > .jstree-anchor').trigger('click');
+                break;
+            }
+        }
+    });
 }
 
 // 默认每次显示的最多子节点数
@@ -404,5 +434,5 @@ function TriggerTreeNodeClick(node_id){
     const node = GetTreeNodeById(node_id);
     if(!node) return;
     // 触发节点click事件
-    $('#' + node.id + " .jstree-anchor").trigger('click');
+    $('#' + node.id + ' > .jstree-anchor').trigger('click');
 }

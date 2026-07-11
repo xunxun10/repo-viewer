@@ -1,14 +1,18 @@
 const https = require('https'); 
 const Buffer = require('buffer').Buffer; // 如果使用 Node.js v12+，需要引入 Buffer 模块 
 const XmlParser = require('fast-xml-parser');
-const {MyDate, MyUnit} = require('../util/my_util')
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const {MyDate, MyUnit, MyCheck} = require('../util/my_util')
 const MyLog = require('../util/my_log')
+const MyFile = require('../util/my_file');
 
 /**
  * 通过svn命令行工具获取SVN远程仓库的信息，需要确保主机上已经安装svn客户端
  */
 class SvnCommandApi{
-    constructor(repo_url, user, password, os_type) {
+    constructor(repo_url, user, password, os_type, cache_root_dir = null) {
         // 如果repo_url指定svn版本则拆解为url和版本号
         var idx = repo_url.indexOf('@');
         if(idx !== -1){
@@ -24,11 +28,199 @@ class SvnCommandApi{
         this.password = password;
 
         this.os_type = os_type;
+        this.cache_dir = null;      // 本地缓存根目录（由 InitCache 设置）
+        this.local_path = null;     // checkout 到的本地路径
+
+        // 如果传入了缓存根目录，自动初始化
+        if (cache_root_dir) {
+            this.InitCache(cache_root_dir);
+        }
+
         MyLog.Info(`svn command api init, repo: ${repo_url}, fixed_version: ${this.svn_version}, os type:${this.os_type}`);
     }
 
     GetCacheStatus(){
+        if (this.local_path && fs.existsSync(this.local_path)) {
+            try {
+                // 检查 .svn 目录是否存在以确认是有效的 checkout
+                const svnDir = path.join(this.local_path, '.svn');
+                if (fs.existsSync(svnDir)) {
+                    return {
+                        local_path: this.local_path,
+                        br_name: path.basename(this.local_path),
+                        up_time: '',
+                    };
+                }
+            } catch (e) {
+                MyLog.Warn(`GetCacheStatus error: ${e.message}`);
+            }
+        }
         return null;
+    }
+
+    /**
+     * 初始化本地缓存目录，按仓库根目录级别创建缓存
+     * @param {string} cache_root_dir - 缓存根目录
+     */
+    InitCache(cache_root_dir) {
+        // 使用仓库根目录作为缓存 key，确保同一仓库共用缓存
+        this.repo_root_url = this.GetRepoRoot(this.repo_url);
+        const hash = crypto.createHash('md5').update(this.repo_root_url).digest('hex');
+        this.repo_hash = hash;
+        this.cache_dir = path.join(cache_root_dir, hash + '.svn');
+        this.local_path = this.cache_dir;
+        this.cache_root_dir = cache_root_dir;
+        MyLog.Info(`svn cache init: repo_root=${this.repo_root_url} -> ${this.local_path}`);
+        // 确保缓存目录存在
+        MyFile.MkDir(this.cache_dir);
+    }
+
+    /**
+     * 获取仓库根目录 URL（缓存用）
+     */
+    GetRepoRootUrl() {
+        if (!this.repo_root_url) {
+            this.repo_root_url = this.GetRepoRoot(this.repo_url);
+        }
+        return this.repo_root_url;
+    }
+
+    /**
+     * 确保本地副本就绪：未 checkout 则 checkout，已存在则按需 update
+     * @param {boolean} force - 是否强制更新
+     */
+    async EnsureRepoReady(force = false) {
+        const hasWorkingCopy = this.local_path && fs.existsSync(path.join(this.local_path, '.svn'));
+        if (!hasWorkingCopy) {
+            await this.CheckoutRepo();
+        } else {
+            await this.UpdateRepo(force);
+        }
+    }
+
+    /**
+     * checkout 仓库根目录到本地
+     */
+    async CheckoutRepo() {
+        if (!this.cache_dir) {
+            throw new Error('svn cache not initialized, call InitCache first');
+        }
+        const rootUrl = this.GetRepoRootUrl();
+        MyLog.Info(`svn checkout repo root: ${rootUrl} -> ${this.local_path}`);
+        await this._GetSvnCommandResult(`checkout "${rootUrl}" "${this.local_path}"`).catch(SvnCommandApi._ProcessCommandError);
+        // 记录更新时间
+        this._SaveLastUpdateTime();
+        MyLog.Info(`svn checkout completed: ${this.local_path}`);
+    }
+
+    /**
+     * 更新本地副本：距上次更新超过 1 天时执行 svn update
+     * @param {boolean} force - 是否强制更新
+     */
+    async UpdateRepo(force = false) {
+        if (!this.local_path || !fs.existsSync(this.local_path)) return;
+
+        // 检查上次更新时间
+        const lastUpdateFile = path.join(this.cache_root_dir, this.repo_hash + '.last-update');
+        if (!force && fs.existsSync(lastUpdateFile)) {
+            const lastUpdateContent = fs.readFileSync(lastUpdateFile, 'utf-8').trim();
+            const lastUpdateTime = new Date(lastUpdateContent);
+            const now = new Date();
+            const diffHours = (now - lastUpdateTime) / (1000 * 60 * 60);
+            if (diffHours < 24) {
+                MyLog.Debug(`svn update skipped, last update was ${diffHours.toFixed(1)} hours ago`);
+                return;
+            }
+        }
+
+        MyLog.Info(`svn update: ${this.local_path}`);
+        await this._GetSvnCommandResult(`update "${this.local_path}"`).catch(SvnCommandApi._ProcessCommandError);
+        this._SaveLastUpdateTime();
+        MyLog.Info(`svn update completed: ${this.local_path}`);
+    }
+
+    /**
+     * 保存上次更新时间
+     */
+    _SaveLastUpdateTime() {
+        try {
+            const lastUpdateFile = path.join(this.cache_root_dir, this.repo_hash + '.last-update');
+            fs.writeFileSync(lastUpdateFile, new Date().toISOString());
+        } catch (e) {
+            MyLog.Warn(`save last update time failed: ${e.message}`);
+        }
+    }
+
+    /**
+     * 从本地 checkout 目录递归列出所有文件
+     * @param {string} relativePath - 相对路径
+     * @returns {Promise<Array>} 文件列表 [{text, path, size, date}]
+     */
+    async GetLocalFileList(relativePath = '') {
+        if (!this.local_path) {
+            throw new Error('svn not checked out locally');
+        }
+        const searchPath = relativePath
+            ? path.join(this.local_path, relativePath)
+            : this.local_path;
+        const files = [];
+        await this._walkDirAsync(searchPath, files, '');
+        return files;
+    }
+
+    /**
+     * 异步递归遍历目录（避免同步 fs 阻塞事件循环）
+     * @param {string} dir - 当前目录路径
+     * @param {Array} results - 结果数组
+     * @param {string} baseRelative - 当前相对路径前缀
+     */
+    async _walkDirAsync(dir, results, baseRelative) {
+        let entries;
+        try {
+            entries = await fs.promises.readdir(dir, { withFileTypes: true });
+        } catch (e) {
+            return;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            const relative = baseRelative
+                ? baseRelative.replace(/\\/g, '/') + '/' + entry.name
+                : entry.name;
+
+            if (entry.isDirectory()) {
+                if (entry.name === '.svn') continue;
+                await this._walkDirAsync(fullPath, results, relative);
+            } else {
+                try {
+                    const stat = await fs.promises.stat(fullPath);
+                    results.push({
+                        text: entry.name,
+                        path: relative.replace(/\\/g, '/'),
+                        size: stat.size,
+                        date: stat.mtime ? MyDate.GetDateStr(stat.mtime, true) : '',
+                    });
+                } catch (e) {
+                    // 跳过无法读取的文件
+                }
+            }
+        }
+    }
+
+    /**
+     * 搜索仓库文件 - 公开方法
+     * @param {string} searchUrl - 搜索起始 URL
+     * @param {RegExp} pattern - 编译后的正则
+     * @returns {Promise<{matched: array}>}
+     */
+    async SearchFiles(searchUrl, pattern) {
+        await this.EnsureRepoReady();
+        const repoRootUrl = this.GetRepoRootUrl();
+        let relativePath = '';
+        if (searchUrl.startsWith(repoRootUrl)) {
+            relativePath = searchUrl.substring(repoRootUrl.length + 1);
+        }
+        const RepoSearch = require('./repo_search');
+        return RepoSearch.SearchInSvn(this, relativePath, pattern);
     }
 
     /**
@@ -64,9 +256,17 @@ class SvnCommandApi{
                 var svn_exe = 'svn';
             }
             // 密码暴露在命令行中容易泄露，后续需要择期优化
-            var auth_part = this.password ? `--username ${this.user} --password ${this.password}` : '';
+            var auth_part = '';
+            if (!MyCheck.IsEmpty(this.user)) {
+                auth_part = `--username ${this.user}`;
+                if (!MyCheck.IsEmpty(this.password)) {
+                    auth_part += ` --password ${this.password}`;
+                }
+            }
             var cmd_str = `${svn_exe} --non-interactive --trust-server-cert ${auth_part} ${cmd_params}`;
-            MyLog.Debug('exec cmd: ' + cmd_str, true);
+            // 密码脱敏后再日志
+            var logCmd = cmd_str.replace(/--password\s+\S+/g, '--password ******');
+            MyLog.Debug('exec cmd: ' + logCmd, true);
             // 注意设置缓冲区大小最大为100MB，否则读取大文件时会报错：stdout maxBuffer length exceeded
             exec(cmd_str, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
                 if(error){
@@ -94,8 +294,8 @@ class SvnCommandApi{
     
     static _ProcessCommandError(error){
         var msg = `${error.message}`;
-        // 需要替换掉密码相关敏感信息
-        msg = msg.replace(/--password\s+\S+/, '--password ******');
+        // 需要替换掉密码相关敏感信息（加 g 标志处理所有出现）
+        msg = msg.replace(/--password\s+\S+/g, '--password ******');
         // 如果换行符前面的文字不是标点符号，则替换为一个.
         msg = msg.replace(/([^.;\n\r,。；])\s*\n/g, '$1; \n');
         MyLog.Error(msg);

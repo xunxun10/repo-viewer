@@ -13,4 +13,4 @@
 
 1.目前仅支持使用本地客户端访问远程仓库的模式，因此需要保证svn/git或者svn.exe/git.exe命令可用，且其父目录被设置到了系统环境变量PATH中; svn程序可从VisualSVN Server（windows）或者subversion（linux）获得。
 
-2.密码明文保存在用户目录下，务必不要将应用目录下的配置文件泄露给其他人
+2.密码使用操作系统级加密（safeStorage/DPAPI）或硬件指纹加密后存储在用户目录下，但仍需妥善保管配置文件，避免泄露给他人

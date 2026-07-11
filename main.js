@@ -4,16 +4,17 @@ const { app, BrowserWindow, Menu, ipcMain, dialog } = require('electron')
 const { spawn } = require('child_process');
 const fs = require('fs')
 const path = require('path')
-const si = require('systeminformation');
-const crypto = require('crypto');
 const RepoViewer = require('./module/repo_viewer')
+const RepoSearch = require('./module/repo_search')
 const ViewerDb = require('./module/viewer_db')
 const MyConf = require('./util/my_conf')
 const MyFile = require('./util/my_file')
-const {MyDate} = require('./util/my_util')
+const {MyDate, MyCheck} = require('./util/my_util')
 const MyLog = require('./util/my_log')
 const MyOs = require('./util/my_os')
 const MyActionLog = require('./util/my_action_log')
+const { MenuIcon } = require('./util/menu_icons')
+const PasswordEncrypt = require('./util/password_encrypt')
 
 const is_mac = process.platform === 'darwin'
 const is_windows = process.platform === 'win32';
@@ -96,11 +97,8 @@ function CreateMenu(){
           label: 'Data',
           submenu: [
             {
-                label:'set password',
-                click: () => { CallWeb('open-password-panel', g_sys_params.user) }
-            },
-            {
-                label: 'view local data dir',
+                label: 'open local data dir',
+                icon: MenuIcon('dir'),
                 click: () => {
                     MyOs.OpenDir(g_sys_params.local_data_dir);
                     SendInfoToWeb("already open dir: " + g_sys_params.local_data_dir);
@@ -108,11 +106,18 @@ function CreateMenu(){
             },
             {
                 label: 'open settings',
+                icon: MenuIcon('gear'),
                 click: OpenSettings,
             },
             {
+                label:'set password',
+                icon: MenuIcon('key'),
+                click: () => { CallWeb('open-password-panel', { user: g_sys_params.user, hasPwd: !MyCheck.IsEmpty(g_sys_params.password) }) }
+            },
+            {
                 label: 'view action logs',
-                click: () => { CallWeb('show-action-logs', MyActionLog.GetLines(100)); },
+                icon: MenuIcon('list'),
+                click: () => { CallWeb('show-action-logs', MyActionLog.GetLines(200)); },
             },
           ]
         },
@@ -121,34 +126,65 @@ function CreateMenu(){
             click: () => { AlertToWeb(MyFile.SyncRead(path.join(__dirname, 'help/help.html'))); },
         },
         {
+            label: 'DevTools',
+            click: () => { G_MAIN_WINDOW.webContents.openDevTools(); }
+        },
+        {
             label: 'About',
             submenu: [
                 {
                     label: 'About',
+                    icon: MenuIcon('info'),
                     // 向前台发送消息
                     click: () => { AlertToWeb(GetAboutText()); },
                 },
                 {
                     label: 'License',
+                    icon: MenuIcon('doc'),
                     // 向前台发送消息
                     click: () => { AlertToWeb(MyFile.SyncRead(path.join(__dirname, 'LICENSE'))); },
                 }
             ]
         },
-        {
-            label: 'DevTools',
-            click: () => { G_MAIN_WINDOW.webContents.openDevTools(); }
-        },
     ])
 }
 
-function Init(){
+async function Init(){
     MyLog.Init(path.join(g_sys_params.local_data_dir, 'logs', 'app'));
 
     g_conf = new MyConf(path.join(g_sys_params.local_data_dir, g_sys_params.config_file_name));
     g_sys_params.db_file = path.join(g_sys_params.local_data_dir, g_sys_params.db_file_name);
     g_sys_params.user = g_conf.Get('user');
+
+    // 只在需要解密已有密码时生成硬件指纹密钥
+    var encryptType = g_conf.Get('encrypt_type');
+    if (encryptType === 'hw_fingerprint') {
+        g_sys_params.encryp_key = await PasswordEncrypt.genEncrypKey();
+        MyLog.Info('[PasswordEncrypt] hw key generated for decrypting existing password');
+    }
+
+    // 解密密码
     g_sys_params.password = g_conf.Get('password');
+    if (g_sys_params.password) {
+        try {
+            var decrypted = PasswordEncrypt.decrypt(g_sys_params.password, encryptType, g_sys_params.encryp_key);
+            if (decrypted !== null) {
+                g_sys_params.password = decrypted;
+            } else {
+                // decrypt 返回 null 表示对应解密方式不可用
+                if (encryptType === 'safe_storage') {
+                    MyLog.Warn('Password encrypted with safeStorage but it is not available');
+                } else if (encryptType === 'hw_fingerprint') {
+                    MyLog.Error('Password encrypted with hardware fingerprint but encryp_key is not available');
+                }
+                g_sys_params.password = '';
+            }
+        } catch (e) {
+            MyLog.Warn('Password decryption failed: ' + e.message);
+            g_sys_params.password = '';
+        }
+    }
+
     g_sys_params.repo_cache_dir = g_conf.GetOrSet('repo_cache_dir', path.join(g_sys_params.local_data_dir, 'repo_cache'));
     MyFile.MkDir(g_sys_params.repo_cache_dir);
     viewer_db.Init(g_sys_params.db_file);
@@ -162,25 +198,11 @@ function Init(){
     g_sys_params.daily_update_count = parseInt(g_conf.GetOrSet('daily_update_count', 6), 10);
 
     MyActionLog.Init(path.join(g_sys_params.local_data_dir, 'logs'));
-
-    //_GenEncrypPassword();
-}
-
-// 根据网卡、mac地址、CPU、内存型号等硬件信息生成加密密码
-async function _GenEncrypPassword(){
-    var hw_info = await si.get({
-        networkInterfaces: 'mac,ip4',
-        cpu: 'manufacturer,brand,speed,cores',
-    });
-    var hw_str = JSON.stringify(hw_info);
-    var hw_hash = crypto.createHash('md5').update(hw_str).digest('hex');
-    //console.log(hw_hash);
-    g_sys_params.encryp_key = hw_hash;
 }
 
 G_MAIN_WINDOW = null
 
-const createWindow = () => {
+const createWindow = async () => {
     // 设置icon路径，windows与arm版本路径不同
     if(is_windows){
         var icon_path = path.join(__dirname, 'res/img/repo-viewer.ico')
@@ -193,7 +215,7 @@ const createWindow = () => {
     G_MAIN_WINDOW = new BrowserWindow({
       width: 1200,
       height: 800,
-      backgroundColor: '#f0f0f0', // 设置窗口背景色,不生效
+      backgroundColor: '#ffffff', // 窗口背景色，与 body 背景一致
       icon: icon_path,
       title: "RepoViewer", // 设置默认窗口标题
       webPreferences: {
@@ -212,7 +234,7 @@ const createWindow = () => {
         }
     })
 
-    Init()
+    await Init()
 
     // 创建菜单
     Menu.setApplicationMenu(CreateMenu())
@@ -315,9 +337,9 @@ async function SetLastRepo(repo_root){
  * @param {string} repo_url 仓库地址，如果不传则使用上次访问的仓库地址
  * @param {boolean} init_flag 是否为初始化标志，如果为true，则会进行一些初始化动作，如重置viewer实例并设置当前仓库查看器等
  */
-async function RefreshRepoTree(repo_url=null, init_flag=false){
+async function RefreshRepoTree(repo_url=null, init_flag=false, force=false){
     let first_access = false;
-    if(g_sys_params.user && g_sys_params.password){
+    if(!MyCheck.IsEmpty(g_sys_params.user)){
         if(!g_sys_params.cur_repo_viewer || init_flag){
             // 首次访问时设置仓库查看器
             if(!repo_url){
@@ -334,7 +356,7 @@ async function RefreshRepoTree(repo_url=null, init_flag=false){
             // 如果包含版本需要去除，版本号已经初始化在了api对象中，无需此处传入
             repo_url = repo_url.substring(0, repo_url.indexOf('@'));
         }
-        let repo_tree = await g_sys_params.cur_repo_viewer.Api().GetRepoTree(repo_url);
+        let repo_tree = await g_sys_params.cur_repo_viewer.Api().GetRepoTree(repo_url, force);
         CallWeb('show-repo-tree', {url: repo_tree.url, tree: repo_tree});
         
         // 更新窗口标题，显示当前仓库信息
@@ -367,18 +389,35 @@ function ShowCacheStatus(){
 function HandleWebMsg(event, msg){
     let value = msg.data;
     try{
-        console.debug(MyDate.Now() + " handle from web: " + msg.type + ' : ' + JSON.stringify(value).substring(0, 1000))
+        // 对敏感消息脱敏后再日志
+        var logValue = (msg.type === 'set-password' && value) ? { ...value, password: '****' } : value;
+        console.debug(MyDate.Now() + " handle from web: " + msg.type + ' : ' + JSON.stringify(logValue).substring(0, 1000))
 
         var ProcessWebCall = {
             "close-app":function(v){
                 // 收到前台检查后的退出消息，直接退出
                 app.quit();
             },
-            "set-password":function(v){
+            "set-password":async function(v){
                 g_conf.Set('user', v.user)
-                g_conf.Set('password', v.password)
                 g_sys_params.user = v.user
-                g_sys_params.password = v.password
+                if(v.password !== undefined){
+                    if (v.password === '') {
+                        // 空密码：清空存储，encrypt_type 也清除
+                        g_conf.Set('password', '');
+                        g_conf.Set('encrypt_type', '');
+                    } else {
+                        // 如果 safeStorage 不可用且尚无硬件密钥，现场生成
+                        if (!PasswordEncrypt.isSafeStorageAvailable() && !g_sys_params.encryp_key) {
+                            MyLog.Info('[PasswordEncrypt] generating hw key for save (safeStorage unavailable)');
+                            g_sys_params.encryp_key = await PasswordEncrypt.genEncrypKey();
+                        }
+                        var result = PasswordEncrypt.encrypt(v.password, g_sys_params.encryp_key);
+                        g_conf.Set('password', result.encrypted);
+                        g_conf.Set('encrypt_type', result.encryptType);
+                    }
+                    g_sys_params.password = v.password
+                }
                 SendInfoToWeb("save password ok");
             },
             "set-settings":function(v){
@@ -410,6 +449,12 @@ function HandleWebMsg(event, msg){
                 // 获取保存的仓库访问列表信息
                 viewer_db.GetAccessedRepos().then((data) => {
                     CallWeb('init-accessed-repo-list', data)
+                })
+            },
+            "get-recent-repos":function(v){
+                // 获取最近访问的仓库列表
+                viewer_db.GetRecentAccessedRepos(15).then((data) => {
+                    CallWeb('show-recent-repos', data)
                 })
             },
             "edit-accessed-repo-list":async function(v){
@@ -495,8 +540,59 @@ function HandleWebMsg(event, msg){
                 g_sys_params.cur_repo_viewer.Api().RefreshRepoTree(v);
                 ShowCacheStatus();
             },
+            'manual-batch-update':async function(v){
+                // 手动触发批量更新（在操作日志界面点击按钮触发）
+                MyLog.Info('Manual batch update triggered by user from action logs');
+                MyActionLog.Add('Manual batch update triggered by user from action logs', 'info');
+                await RunDailyUpdate();
+                // 更新完成后发送最新日志给前端刷新界面
+                CallWeb('batch-update-completed', MyActionLog.GetLines(200));
+            },
             'get-action-logs':function(v){
-                CallWeb('show-action-logs', MyActionLog.GetLines(v || 100));
+                CallWeb('show-action-logs', MyActionLog.GetLines(v || 200));
+            },
+            // ==================== 仓库文件搜索 ====================
+            'check-svn-cache':function(v){
+                // 检查SVN是否已checkout到本地
+                try {
+                    var api = g_sys_params.cur_repo_viewer.Api();
+                    var status = api.GetCacheStatus();
+                    CallWeb('svn-cache-status', {cached: !!status, local_path: status ? status.local_path : ''});
+                } catch (e) {
+                    CallWeb('svn-cache-status', {cached: false, local_path: ''});
+                }
+            },
+            'checkout-svn-repo':async function(v){
+                // 用户确认后确保 SVN 仓库本地就绪（checkout 或 update）
+                var api = g_sys_params.cur_repo_viewer.Api();
+                try {
+                    CallWeb('info-on-bg', '正在准备 SVN 本地副本...');
+                    await api.EnsureRepoReady(true);
+                    CallWeb('info-on-bg', 'SVN 本地副本就绪');
+                    CallWeb('svn-cache-status', {cached: true, local_path: api.local_path || ''});
+                } catch (e) {
+                    SendErrorToWeb('SVN 准备失败: ' + (e?.message || String(e)));
+                    CallWeb('svn-checkout-failed', {error: e?.message || String(e)});
+                }
+            },
+            'search-repo-files':async function(v){
+                // 搜索仓库文件
+                // v: {path, pattern, isRegex}
+                var api = g_sys_params.cur_repo_viewer.Api();
+                var pattern = RepoSearch.BuildPattern(v.pattern, v.isRegex);
+
+                if (!pattern) {
+                    CallWeb('show-search-results', {matched: [], error: '搜索模式无效'});
+                    return;
+                }
+
+                try {
+                    var result = await api.SearchFiles(v.path, pattern);
+                    CallWeb('show-search-results', result);
+                } catch (e) {
+                    MyLog.Error('search error: ' + (e?.message || String(e)));
+                    CallWeb('show-search-results', {matched: [], error: '搜索失败: ' + (e?.message || String(e))});
+                }
             },
         }
         ProcessWebCall[msg.type](value);
@@ -568,9 +664,7 @@ async function RunDailyUpdate() {
     await viewer_db.CleanupRepoAccess();
 
     const taskId = `daily-${Date.now()}`;
-    MyLog.Info(`[${taskId}] Starting daily repo update task...`);
-    SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Starting daily repo update...`);
-    MyActionLog.Add(`[${taskId}] Starting daily repo update...`, 'info');
+    const taskStartTime = Date.now();
 
     try {
         const repoCount = g_sys_params.daily_update_count > 0 ? g_sys_params.daily_update_count : 6;
@@ -583,20 +677,31 @@ async function RunDailyUpdate() {
             return;
         }
 
-        MyLog.Info(`[${taskId}] Found ${repos.length} repos to update: ${JSON.stringify(repos)}`);
-        SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Daily update: updating ${repos.length} repos...`);
+        MyLog.Info(`[${taskId}] Starting daily repo update task: ${repos.length} repos to update`);
+        SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Starting daily update: ${repos.length} repos...`);
+        MyActionLog.Add(`[${taskId}] Starting daily repo update: ${repos.length} repos to update`, 'info');
+
+        let successCount = 0;
+        let failCount = 0;
 
         for (const repo_url of repos) {
             try {
+                const repoStartTime = Date.now();
+                const repoStartStr = MyDate.GetTime4Str(new Date(repoStartTime));
                 MyLog.Info(`[${taskId}] Updating repo: ${repo_url}`);
-                SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Updating repo: ${repo_url}`);
+                SendInfoToWeb(`[${repoStartStr}] Updating repo: ${repo_url}`);
 
                 const viewer = new RepoViewer(repo_url, g_sys_params.user, g_sys_params.password, os_type, g_sys_params.repo_cache_dir);
-                await viewer.Api().GetRepoTree(repo_url);
+                await viewer.Api().GetRepoTree(repo_url, true); // force=true 强制刷新缓存
 
-                MyActionLog.Add(`[${taskId}] Updated repo: ${repo_url}`, 'info');
-                MyLog.Info(`[${taskId}] Successfully updated repo: ${repo_url}`);
+                const repoElapsed = Date.now() - repoStartTime;
+                const repoElapsedStr = repoElapsed >= 1000 ? `${(repoElapsed / 1000).toFixed(1)}s` : `${repoElapsed}ms`;
+                successCount++;
+                MyActionLog.Add(`[${taskId}] Updated repo: ${repo_url} (cost: ${repoElapsedStr})`, 'info');
+                MyLog.Info(`[${taskId}] Successfully updated repo: ${repo_url} (cost: ${repoElapsedStr})`);
+                SendInfoToWeb(`[${MyDate.GetTime4Str(new Date())}] Updated repo: ${repo_url} (cost: ${repoElapsedStr})`);
             } catch (e) {
+                failCount++;
                 const errMsg = `[${taskId}] Failed to update repo: ${repo_url}, error: ${e.message}`;
                 MyLog.Error(errMsg);
                 MyActionLog.Add(errMsg, 'error');
@@ -604,7 +709,9 @@ async function RunDailyUpdate() {
             }
         }
 
-        const completeMsg = `[${taskId}] Daily repo update completed, updated ${repos.length} repos`;
+        const totalElapsed = Date.now() - (taskStartTime || Date.now());
+        const totalElapsedStr = totalElapsed >= 1000 ? `${(totalElapsed / 1000).toFixed(1)}s` : `${totalElapsed}ms`;
+        const completeMsg = `[${taskId}] Daily repo update completed: total ${repos.length}, success ${successCount}, failed ${failCount} (cost: ${totalElapsedStr})`;
         MyLog.Info(completeMsg);
         MyActionLog.Add(completeMsg, 'info');
         SendInfoToWeb(completeMsg);

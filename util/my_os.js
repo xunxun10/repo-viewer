@@ -1,6 +1,34 @@
-const { exec } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { shell } = require('electron');
-const path = require('path')
+const path = require('path');
+const MyLog = require('./my_log');
+
+/**
+ * 解析命令行字符串为 [程序名, 参数...]，按空格分割，单/双引号内的空格保留
+ * @param {string} cmd - 命令行字符串
+ * @returns {string[]}
+ */
+function parseCmdArgs(cmd) {
+    const parts = [];
+    let current = '';
+    let quoteChar = '';
+    for (const ch of cmd) {
+        if (ch === '"' || ch === "'") {
+            if (quoteChar) {
+                if (ch === quoteChar) { quoteChar = ''; }
+                else { current += ch; }
+            } else {
+                quoteChar = ch;
+            }
+        } else if (ch === ' ' && !quoteChar) {
+            if (current) { parts.push(current); current = ''; }
+        } else {
+            current += ch;
+        }
+    }
+    if (current) parts.push(current);
+    return parts;
+}
 
 class MyOs{
 
@@ -24,14 +52,7 @@ class MyOs{
      * @param {*} dir_path 
      */
     static OpenDir(dir_path){
-        if(process.platform == 'win32'){
-            exec('start "" "' + dir_path + '"');
-        }else if(process.platform == 'darwin'){
-            exec('open "' + dir_path + '"');
-        }else{
-            // For Linux and other platforms
-            exec('xdg-open "' + dir_path + '"');
-        }
+        shell.openPath(dir_path);
     }
 
     /**
@@ -51,31 +72,45 @@ class MyOs{
     }
 
     static OpenFileWithIde(file_path, dir_path='', ide_cmd=''){
-        // 直接调用code命令打开文件,注意不同平台差异
         if(!ide_cmd){
             if(process.platform == 'win32'){
-                ide_cmd = 'code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"'; // Windows默认使用VS Code
+                ide_cmd = 'code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"';
             }else if(process.platform == 'darwin'){
-                ide_cmd = 'code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"'; // macOS默认使用VS Code
+                ide_cmd = 'code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"';
             }else{
-                ide_cmd = 'code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"'; // For Linux and other platforms，默认使用VS Code
+                ide_cmd = 'code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"';
             }
         }
         
-        if(dir_path){
-            // 将命令中的 %%DIR_PATH%% 替换为实际的目录路径，并确保路径被正确引用
-            ide_cmd = ide_cmd.replace('%%DIR_PATH%%', dir_path);
-        }
-        // 将命令中的 %%FILE_PATH%% 替换为实际的文件路径，并确保路径被正确引用
-        ide_cmd = ide_cmd.replace('%%FILE_PATH%%', file_path);
-        // 执行命令
-        exec(ide_cmd, { encoding: 'utf-8'}, (error) => {
-            if (error) {
-                // 将错误信息转换为字符串，避免中文乱码问题
-                const errorMsg = error.toString();
-                throw new Error(`open file with ide cmd [ ${ide_cmd} ] fail: ${errorMsg}`);
+        // 解析命令模板，去掉引号后按空格分割
+        const cmdParts = parseCmdArgs(ide_cmd);
+        const program = cmdParts[0];
+        const args = cmdParts.slice(1).map(arg => {
+            arg = arg.replace('%%FILE_PATH%%', file_path);
+            if(dir_path){
+                arg = arg.replace('%%DIR_PATH%%', dir_path);
             }
+            return arg;
         });
+        
+        if (process.platform === 'win32') {
+            // Windows: 通过 cmd.exe /c 启动（不加 /s），libuv 自动为含空格参数加上引号，
+            // cmd.exe 按标准解析规则处理，不会剥离引号
+            const child = spawn('cmd.exe', ['/c', program, ...args], { shell: false, windowsHide: true });
+            child.on('error', (error) => {
+                MyLog.Error(`open file with ide cmd fail: ${error.toString()}`);
+            });
+        } else {
+            // macOS / Linux: execFile 不经过 shell，参数以数组形式传递，规避空格分词
+            const child = execFile(program, args, (error) => {
+                if (error) {
+                    MyLog.Error(`open file with ide cmd fail: ${error.toString()}`);
+                }
+            });
+            child.on('close', (code) => {
+                MyLog.Info('[OpenFileWithIde] process exited with code: ' + code);
+            });
+        }
     }
 
     /**

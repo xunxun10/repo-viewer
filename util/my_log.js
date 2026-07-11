@@ -104,9 +104,14 @@ class MyLog {
         }
     }
 
-    // 提供一个脱敏函数，对类似 --password xxx 的敏感信息脱敏处理
+    // 提供一个脱敏函数，对敏感信息脱敏处理
     static MaskSensitiveInfo(cmd_str) {
-        return cmd_str.replace(/(--password\s+)([^\s]+)/gi, '$1****');
+        if (!cmd_str) return cmd_str;
+        // 脱敏命令行 --password xxx 格式
+        cmd_str = cmd_str.replace(/(--password\s+)([^\s]+)/gi, '$1****');
+        // 脱敏 JSON 中 "password": "xxx" 格式
+        cmd_str = cmd_str.replace(/("password"\s*:\s*")[^"]+(")/gi, '$1****$2');
+        return cmd_str;
     }
 }
 

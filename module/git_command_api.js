@@ -7,6 +7,7 @@ const MyFile = require('../util/my_file');
 const { MyDate, MyUnit } = require('../util/my_util');
 const {MyDevTool} = require('../util/my_devtool');
 const { url } = require('inspector');
+const RepoSearch = require('./repo_search');
 
 class GitCommandApi {
     constructor(repo_url, user, password, os_type, cache_dir) {
@@ -142,12 +143,28 @@ class GitCommandApi {
     }
 
     /**
+     * 获取远程仓库的默认分支名
+     */
+    async _GetDefaultBranch() {
+        // 先确保仓库已存在且有远程引用
+        if (fs.existsSync(this.repo_path)) {
+            try {
+                process.chdir(this.repo_path);
+                const headRef = await this._GetGitCommandResult(`symbolic-ref refs/remotes/origin/HEAD`, this.repo_path, false);
+                const branch = headRef.trim().replace('refs/remotes/origin/', '');
+                if (branch) return branch;
+            } catch {}
+        }
+        return 'master';
+    }
+
+    /**
      * 从远程仓库拉取代码, 如果本地已经存在，则更新代码, 并切换到指定分支, 并切换到指定文件路径, 如果文件路径为空，则切换到仓库根目录, 如果文件路径为'./xxx/xx'则切换到仓库根目录下的xxx目录。
      * 同一个分支，只有距离上次更新时间大于指定分钟时才进行更新
      * @param {*} branch    分支信息
      * @param {*} filePath  文件路径
      */
-    async _CloneOrUpdateRepo(branch_type, branch, filePath) {
+    async _CloneOrUpdateRepo(branch_type, branch, filePath, force = false) {
         if(branch == ''){
             branch = 'master';
         }
@@ -158,13 +175,13 @@ class GitCommandApi {
 
         const lastBrFile = path.join(this.repo_path, `--repo-viewer-last-branch.info`);
 
-        if (fs.existsSync(lastUpdateFile)) {
+        if (fs.existsSync(lastUpdateFile) && !force) {
             const lastUpdateContent = fs.readFileSync(lastUpdateFile, 'utf-8');
             const lastUpdateTime = new Date(lastUpdateContent);
             const now = new Date();
             const diffMinutes = (now - lastUpdateTime) / (1000 * 60);
-            // 如果距离上次更新时间小于7天（10080分钟），则不更新
-            if (diffMinutes <= 10080) {
+            // 如果距离上次更新时间小于14天（20160分钟），则不更新
+            if (diffMinutes <= 20160) {
                 shouldFetch = false;
                 if (!this._cache_status.up_time){
                     this._cache_status.up_time = lastUpdateContent;
@@ -182,8 +199,14 @@ class GitCommandApi {
             }
         }
 
+        // 强制刷新时，确保重新拉取并切换
+        if (force) {
+            shouldFetch = true;
+            shouldCheckout = true;
+        }
+
         if (!fs.existsSync(this.repo_path)) {
-            await this._GetGitCommandResult(`clone ${this.repo_url} ${this.repo_path}`, this.cache_dir);
+            await this._GetGitCommandResult(`clone ${this.repo_url} "${this.repo_path}"`, this.cache_dir);
 
             // 进入到仓库根目录
             process.chdir(this.repo_path);
@@ -333,9 +356,15 @@ class GitCommandApi {
         let tree = { dirs: [], files: [] };
 
         lines.forEach(line => {
-            let [mode, type, hash, curFilePath] = line.split(/\s+/);
+            // ls-tree输出格式: <mode> SP <type> SP <object> TAB <file>，文件名可能含空格，需用TAB分割
+            const parts = line.split('\t');
+            const metaParts = parts[0].split(/\s+/);
+            const mode = metaParts[0], type = metaParts[1], hash = metaParts[2];
+            let curFilePath = parts.length > 1 ? parts[1] : metaParts.slice(3).join(' ');
             // 去除filePath中的前缀filePath,注意需要从第一个字符开始匹配
-            curFilePath = curFilePath.replace(new RegExp('^' + filePath + '/'), '');
+            // 转义filePath中的正则特殊字符（如.变成\.），防止new RegExp时误匹配
+            const escapedPrefix = filePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            curFilePath = curFilePath.replace(new RegExp('^' + escapedPrefix + '/'), '');
             if (type === 'tree') {
                 let cur_node = { text: curFilePath, date: '', children: ["."] };
                 tree.dirs.push(cur_node);
@@ -345,17 +374,17 @@ class GitCommandApi {
             }
         });
 
-        // 获取文件的作者、日期、大小
-        for (let file of tree.files) {
+        // 获取文件的作者、日期、大小（所有文件并行查询）
+        await Promise.all(tree.files.map(async (file) => {
             // 拼接完整路径
-            var full_path = path.join(filePath, file.text);
+            const full_path = path.join(filePath, file.text);
             // 如果为submodule，需要跳过
             if(this.submodule_path_dict[full_path]){
                 file.author = 'submodule';
                 file.date = '0000-00-00 00:00:00';
                 file.size = MyUnit.FileSizeStr(0);
                 file.size_num = 0;
-                continue;
+                return;
             }
             try {
                 let logPromise = this._GetGitCommandResult(`log -1 --pretty=format:"%an|%ad" --date=iso -- "${full_path}"`);
@@ -376,7 +405,7 @@ class GitCommandApi {
                 file.size_num = 0;
                 MyLog.Error(`Failed to get file info for ${full_path}: ${error.message}`);
             }
-        }
+        }));
         return tree;
     }
 
@@ -437,7 +466,7 @@ class GitCommandApi {
      *  "repo_root":"git@github.com:wxbool/video-srt-windows.git"
      * }
      */
-    async GetRepoTree(repo_url = null) {
+    async GetRepoTree(repo_url = null, force = false) {
         if (!repo_url) {
             repo_url = this.repo_url;
         }
@@ -448,6 +477,12 @@ class GitCommandApi {
 
         // 如果repo_url仅包含仓库地址（以.git结尾），返回初始目录结构
         if (repo_url.endsWith('.git')) {
+            // 强制更新时，检测默认分支并使用统一逻辑拉取+切换
+            var defaultBranch = 'master';
+            if (force) {
+                defaultBranch = await this._GetDefaultBranch();
+                await this._CloneOrUpdateRepo('master', defaultBranch, '', true);
+            }
             return {
                 url: repo_url,
                 base: base,
@@ -455,7 +490,7 @@ class GitCommandApi {
                 dirs: [
                     { text: 'branches', date: '', children: ['.'] },
                     { text: 'tags', date: '', children: ['.'] },
-                    { text: 'master', date: '', children: ['.'] },
+                    { text: defaultBranch, date: '', children: ['.'] },
                 ],
                 files: [],
                 server_root: server_root,
@@ -467,7 +502,7 @@ class GitCommandApi {
         // 解析url中的分支信息及分支后的文件路径
         const [branchType, branch, filePath] = this._ExtractBranchFromUrl(repo_url);
         MyLog.Info(`url: ${repo_url}, branchType: ${branchType}, branch: ${branch}, filePath: ${filePath}`);
-        await this._CloneOrUpdateRepo(branchType, branch, filePath);
+        await this._CloneOrUpdateRepo(branchType, branch, filePath, force);
 
         // 如果url中指定的是branches但未指定具体分支，则返回所有分支目录
         if (branchType === 'branches' && branch === '') {
@@ -528,7 +563,7 @@ class GitCommandApi {
         const [branchType, branch, filePath] = this._ExtractBranchFromUrl(file_url);
         await this._CloneOrUpdateRepo(branchType, branch, filePath);
         MyLog.Info('get content of: ' + file_url + ' with version: ' + version);
-        let res = await this._GetGitCommandResult(`show ${version}:${filePath}`);
+        let res = await this._GetGitCommandResult(`show ${version}:"${filePath}"`);
         return res;
     }
 
@@ -658,33 +693,23 @@ class GitCommandApi {
                 var fileLines = filesRes.split('\n').slice(1).filter(line => line);
             }
             fileLines.forEach(line => {
-                // line样式为：M utils.py 或 R80  old.txt -> new.txt
+                // line样式为：M<tab>utils.py  或 R<num><tab>old_path<tab>new_path
                 // 忽略空行和以#开头的行
                 if(!line || line.startsWith('#')){
                     return;
                 }
-                let [action, path] = line.split(/\s+/);     // 注意R80  old.txt -> new.txt会被错误解析为R80和old.txt
-                // 如果action出现R数字，则需要去除后面的数字
-                action = action.replace(/R\d+/, 'R');
+                // git diff --name-status 输出使用TAB分隔，避免文件名含空格时解析错误
+                const tabParts = line.split('\t');
+                const statusPart = tabParts[0];
+                let action = statusPart.replace(/R\d+/, 'R');
+                let path = '', copy_from = '';
 
-                // 如果出现 ->,则需要处理copy_from,例如 R80  old.txt -> new.txt 或 R80  old.txt new.txt
-                let copy_from = '';
-                if(action === 'R'){
-                    // 尝试匹配带箭头的格式
-                    let copyMatch = line.match(/\S+\s+(.*)\s+->\s+(.*)/);
-                    if(copyMatch){
-                        path = copyMatch[2];
-                        copy_from = copyMatch[1];
-                    } else {
-                        // 尝试匹配不带箭头的格式 (R{num} old_path new_path)
-                        copyMatch = line.match(/\S+\s+(\S+)\s+(\S+.*)/);
-                        if(copyMatch){
-                            path = copyMatch[2];
-                            copy_from = copyMatch[1];
-                        } else {
-                            MyLog.Error(`Invalid copy line: ${line}`);
-                        }
-                    }
+                if (action === 'R') {
+                    // 重命名格式: R<num><tab>old_path<tab>new_path
+                    path = tabParts[2] || '';
+                    copy_from = tabParts[1] || '';
+                } else {
+                    path = tabParts.slice(1).join('\t');
                 }
                 
                 // 如果filePath有值，则需要过滤掉非本文件路径的条目
@@ -755,7 +780,7 @@ class GitCommandApi {
      */
     async _GetPreVersion(version, filePath) {
         // 注意此处${version}~1不能改为使用${version}^，^可能是windows下的转义字符
-        let pre_version = await this._GetGitCommandResult(`rev-list -n 1 ${version}~1 -- ${filePath}`);
+        let pre_version = await this._GetGitCommandResult(`rev-list -n 1 ${version}~1 -- "${filePath}"`);
         //console.log('version:' + version + ';    pre_version: ' + pre_version);
         return pre_version.replace(/\s+/g, '');
     }
@@ -870,6 +895,20 @@ class GitCommandApi {
             MyLog.Warn(`获取子模块状态失败: ${error.message}`);
         }
         return submodule_path_dict;
+    }
+
+    /**
+     * 搜索仓库文件 - 公开方法
+     * @param {string} searchUrl - 搜索起始 URL（含分支和路径信息）
+     * @param {RegExp} pattern - 编译后的正则
+     * @returns {Promise<{matched: array}>}
+     */
+    async SearchFiles(searchUrl, pattern) {
+        const [branchType, branch, filePath] = this._ExtractBranchFromUrl(searchUrl);
+        const br = branch || 'master';
+        await this._CloneOrUpdateRepo(branchType, br, filePath);
+
+        return RepoSearch.SearchInGit(this, br, filePath, pattern);
     }
 }
 

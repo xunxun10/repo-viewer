@@ -1,5 +1,7 @@
 .svn/
-dist.files.md5.txt
+dist.files.md5*.txt
+.trae
+AGENTS.md
 
 # Logs
 logs

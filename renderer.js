@@ -93,6 +93,29 @@ if(typeof window.electronAPI != 'undefined'){
             "show-action-logs":function(v){
                 ShowActionLogs(v);
             },
+            "batch-update-completed":function(v){
+                // 批量更新完成，重置按钮并刷新日志内容
+                $('#batch-update-btn').prop('disabled', false);
+                $('#batch-update-status').hide();
+                _RenderActionLogTable(v);
+                Info('Batch update completed');
+            },
+            "show-recent-repos":function(v){
+                ShowRecentRepos(v);
+            },
+            // ==================== 仓库文件搜索 ====================
+            "show-search-results":function(v){
+                // 搜索结果回显到搜索对话框
+                ShowSearchResultsInDialog(v);
+            },
+            "svn-cache-status":function(v){
+                // SVN 缓存状态
+                OnSvnCacheStatus(v);
+            },
+            "svn-checkout-failed":function(v){
+                // SVN checkout 失败时重置搜索状态
+                OnSvnCheckoutFailed(v);
+            },
         }
         ProcessSysCall[msg.type](value);
     })
@@ -537,7 +560,8 @@ function EditAccessedRepoList(repo_list){
 
 function ShowSavedRepoList(repo_list){
     var container = $('#repos');
-    var html = `<div id='saved-repo-list'>`;
+    var html = `<button id="recent-repos-btn" class="top-btn" title="最近访问的仓库">最近</button>`;
+    html += `<div id='saved-repo-list'>`;
     var repo_val_list = [];
     for(var i = 0; i < repo_list.length; i++){
         var url = repo_list[i]['repo'];
@@ -553,6 +577,14 @@ function ShowSavedRepoList(repo_list){
     }
     html += `</div>`;
     container.html(html);
+    // 最近按钮点击后，切换最近仓库面板
+    $('#recent-repos-btn').click(function(){
+        if ($('#recent-repos-board').is(':visible')) {
+            _RestoreFileView();
+        } else {
+            CallSys('get-recent-repos');
+        }
+    });
     // 点击后设置repo_url并调用access-btn
     $(".saved-repo-item").click(function(){
         var repo_url = $(this).attr('url');
@@ -610,6 +642,11 @@ function ToggleSavedRepoItem(repo_url){
 }
 
 function BindEvent(){
+    // 关闭最近仓库面板
+    $('#recent-repos-close-btn').click(function(){
+        _RestoreFileView();
+    });
+
     // settings-btn点击后，从后台获取访问历史进行编辑
     $('#settings-btn').click(function(){
         CallSys('edit-accessed-repo-list');
@@ -628,6 +665,8 @@ function BindEvent(){
         }
         // 重置全局变量
         ClearSelectNode();
+        // 恢复右侧文件视图（如果处于最近面板状态）
+        _RestoreFileView();
     
         CallSys('get-repo-tree', repo_url);
         $("#repo-url").val("");
@@ -706,17 +745,54 @@ function BindHotKey(){
     BindFilePathCopyHotKey("#tree-container");
 }
 
-function ShowActionLogs(logs){
-    if (!logs || logs.length === 0) {
-        MyModal.Alert("No action logs available");
+function ShowRecentRepos(repo_list){
+    if (!repo_list || repo_list.length === 0) {
+        MyModal.Alert("暂无最近访问记录");
         return;
     }
-    var html = `<div class='action-log-container' style='max-height:400px; overflow-y:auto; font-size:12px;'>
+    // 隐藏树和文件列表，显示最近仓库面板（宽度撑满剩余空间）
+    $('#tree-container').hide();
+    $('#repo-files').hide();
+    $('#recent-repos-board').show().css('width', 'calc(100% - 60px)');
+    
+    var html = '';
+    for (var i = 0; i < repo_list.length; i++) {
+        var url = repo_list[i];
+        // 取最后两级路径作为显示名
+        var parts = url.replace(/\/$/,'').split('/');
+        var display = parts.slice(-2).join('/');
+        if (display.length > 45) {
+            display = '...' + display.slice(-42);
+        }
+        html += `<div class='recent-repos-item' title="${url}" url="${url}">${display}</div>`;
+    }
+    $('#recent-repos-list').html(html);
+    // 点击项填充到输入框并访问
+    $(".recent-repos-item").click(function(){
+        var repo_url = $(this).attr('url');
+        $('#repo-url').val(repo_url);
+        $('#access-btn').click();
+    });
+}
+
+function _RestoreFileView() {
+    $('#recent-repos-board').hide();
+    $('#tree-container').show();
+    $('#repo-files').show();
+}
+
+/**
+ * 渲染操作日志表格（供 ShowActionLogs 和 batch-update-completed 共用）
+ */
+function _RenderActionLogTable(logs){
+    if (!logs) logs = [];
+    var reversed = logs.slice().reverse();
+    var html = `<div class='action-log-container' style='font-size:12px;'>
         <table class='table table-condensed table-striped' style='margin-bottom:0;'>
             <thead><tr><th style='width:140px;'>Time</th><th>Level</th><th>Message</th></tr></thead>
             <tbody>`;
-    for (var i = 0; i < logs.length; i++) {
-        var log = logs[i];
+    for (var i = 0; i < reversed.length; i++) {
+        var log = reversed[i];
         var time = log.create_time;
         if (time) {
             var d = new Date(time);
@@ -730,7 +806,56 @@ function ShowActionLogs(logs){
         </tr>`;
     }
     html += `</tbody></table></div>`;
-    MyModal.Alert(html, null, 900);
+    // 替换内容（如果已存在）或创建新内容
+    if ($('#my-alert-content .action-log-container').length > 0) {
+        $('#my-alert-content .action-log-container').replaceWith(html);
+    } else {
+        $('#my-alert-content').html(html);
+    }
+}
+
+function ShowActionLogs(logs){
+    if (!logs || logs.length === 0) {
+        MyModal.Alert("No action logs available");
+        return;
+    }
+    // 构建表格HTML并用Alert显示
+    var reversed = logs.slice().reverse();
+    var html = `<div class='action-log-container' style='font-size:12px;'>
+        <table class='table table-condensed table-striped' style='margin-bottom:0;'>
+            <thead><tr><th style='width:140px;'>Time</th><th>Level</th><th>Message</th></tr></thead>
+            <tbody>`;
+    for (var i = 0; i < reversed.length; i++) {
+        var log = reversed[i];
+        var time = log.create_time;
+        if (time) {
+            var d = new Date(time);
+            time = MyDate.GetDateStr(d, true);
+        }
+        var levelClass = log.level === 'error' ? 'label label-danger' : log.level === 'warn' ? 'label label-warning' : 'label label-info';
+        html += `<tr>
+            <td style='white-space:nowrap;'>${time}</td>
+            <td><span class='${levelClass}'>${log.level}</span></td>
+            <td style='word-break:break-all;'>${log.message}</td>
+        </tr>`;
+    }
+    html += `</tbody></table></div>`;
+    MyModal.Alert(html, null, 900, null, '操作日志');
+    // 在模态框底部追加批量更新按钮（先移除旧的避免重复）
+    var footer = $('#my-alert .modal-footer');
+    $('#batch-update-btn').remove();
+    $('#batch-update-status').remove();
+    var btnHtml = `
+        <button id="batch-update-btn" class="btn btn-primary btn-sm" style="margin-right:10px;">执行批量更新</button>
+    `;
+    $(btnHtml).insertBefore('#my-alert-ok');
+    footer.prepend('<span id="batch-update-status" style="color:#888;display:none;line-height:30px;float:left;">批量更新进行中，请稍候...</span>');
+    // 绑定批量更新按钮事件
+    $('#batch-update-btn').on('click', function(){
+        $(this).prop('disabled', true);
+        $('#batch-update-status').show().text('批量更新进行中，请稍候...');
+        CallSys('manual-batch-update');
+    });
 }
 
 $(function(){

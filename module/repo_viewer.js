@@ -19,7 +19,7 @@ class RepoViewer{
 
         const repo_type = this._GetRepoType(this.repo_url);
         if (repo_type === 'svn') {
-            this.api = new SvnCommandApi(this.repo_url, this.user, this.password, os_type);
+            this.api = new SvnCommandApi(this.repo_url, this.user, this.password, os_type, repo_cache_dir);
         } else {
             this.api = new GitCommandApi(this.repo_url, this.user, this.password, os_type, repo_cache_dir);
         }
@@ -35,6 +35,10 @@ class RepoViewer{
         } else {
             return 'svn';
         }
+    }
+
+    GetRepoType(){
+        return this._GetRepoType(this.repo_url);
     }
 
     Api(){

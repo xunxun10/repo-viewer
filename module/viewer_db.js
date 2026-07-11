@@ -69,6 +69,19 @@ class ViewerDb{
     }
 
     /**
+     * 获取最近访问的仓库列表（按访问时间倒序，去重）
+     * @param {number} limit 返回数量，默认30
+     * @returns {Array<string>} 仓库URL列表
+     */
+    async GetRecentAccessedRepos(limit = 30) {
+        let res = await this.db.Query(
+            'select repo_url, max(access_time) as last_access from repo_access group by repo_url order by last_access desc limit ?',
+            [limit]
+        );
+        return res.map(r => r.repo_url);
+    }
+
+    /**
      * 清理repo_access表中超过1年的记录
      */
     async CleanupRepoAccess() {
