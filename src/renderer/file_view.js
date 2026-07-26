@@ -162,6 +162,7 @@ var g_search = {
     searchPath: '',     // 当前搜索的目录路径
     isSearching: false, // 是否正在搜索
     svnCached: false,   // SVN 是否已 checkout
+    cacheProjectRoot: '', // 缓存的项目根 URL（后端返回）
     pattern: '',        // 当前搜索模式
     isRegex: false,     // 是否正则模式
 };
@@ -257,9 +258,9 @@ function OpenSearchDialog(searchPath) {
     // 绑定搜索事件
     _BindSearchEvents();
 
-    // 对于 SVN，检查缓存状态
+    // 对于 SVN，检查缓存状态（传入搜索路径以获取项目根信息）
     if (!gv.gv_local_cached) {
-        CallSys('check-svn-cache');
+        CallSys('check-svn-cache', {searchPath: g_search.searchPath});
     }
 
     // 聚焦输入框（模态框显示完成后）
@@ -310,8 +311,8 @@ function DoSearch() {
 
     // SVN 且未缓存时，需要先确认 checkout
     if (!gv.gv_local_cached && !g_search.svnCached) {
-        // 弹出确认框
-        var cachePath = gv.gv_repo_url;
+        // 使用后端返回的项目根作为 checkout 提示路径
+        var cachePath = g_search.cacheProjectRoot || g_search.searchPath;
         var confirmHtml = `
         <div>
             <p>搜索需要先 checkout 仓库到本地：</p>
@@ -319,11 +320,11 @@ function DoSearch() {
             <p>是否继续？</p>
         </div>`;
         MyModal.Confirm(confirmHtml, function() {
-            // 用户确认，开始 checkout
+            // 用户确认，开始 checkout（传入搜索路径）
             $('#search-status').text('正在 checkout 仓库到本地...').css('color', '#1a73e8');
             g_search.isSearching = true;
             $('#search-btn').prop('disabled', true);
-            CallSys('checkout-svn-repo');
+            CallSys('checkout-svn-repo', {searchPath: g_search.searchPath});
         }, null, null, '确认 checkout');
         return;
     }
@@ -354,6 +355,7 @@ function _ExecuteSearch(pattern, isRegex) {
  */
 function OnSvnCacheStatus(v) {
     g_search.svnCached = v.cached;
+    g_search.cacheProjectRoot = v.projectRoot || '';
     if (v.cached) {
         $('#search-status').text('本地缓存就绪').css('color', '#188038');
         // 如果有等待中的搜索（checkout 前已输入关键词），重新读取当前输入再执行
@@ -394,8 +396,6 @@ function ShowSearchResultsInDialog(v) {
     for (var i = 0; i < matched.length; i++) {
         var file = matched[i];
         var displayPath = (file.path || file.text || '');
-        var author = (file.author || '');
-        var date = (file.date || '');
         var size = (file.size || '');
         // 使用 data 属性安全传递路径，文本内容通过 text() 设置避免 XSS
         html += `<div class="search-result-item" data-path="${displayPath.replace(/"/g, '&quot;')}" title="${displayPath.replace(/"/g, '&quot;')}">
@@ -413,7 +413,7 @@ function ShowSearchResultsInDialog(v) {
         var file = matched[idx];
         if (file) {
             $(this).find('.search-result-path').text(file.path || file.text || '');
-            var meta = [(file.size || ''), (file.author || ''), (file.date || '')].filter(Boolean).join(' ');
+            var meta = (file.size || '');
             $(this).find('.search-result-meta').text(meta);
         }
     });
@@ -454,16 +454,28 @@ function _JumpToFile(relativePath, searchPath) {
     var startNode = gv.gv_select_node;
     if (!startNode) return;
 
-    _ExpandPathRecursive(startNode, segments.slice(), fileName);
+    _ExpandPathRecursive(startNode.id, segments.slice(), fileName);
 }
+
+// 跳转文件时，子节点等待重试的最大次数
+const _EXPAND_RETRY_MAX = 10;
 
 /**
  * 递归展开路径
- * @param {object} node - 当前树节点
+ * @param {string} nodeId - 当前节点的 id（不带 # 前缀）
  * @param {Array} dirSegments - 剩余目录路径段
  * @param {string} fileName - 目标文件名
+ * @param {number} retryCount - 当前重试次数
  */
-function _ExpandPathRecursive(node, dirSegments, fileName) {
+function _ExpandPathRecursive(nodeId, dirSegments, fileName, retryCount) {
+    if (retryCount === undefined) retryCount = 0;
+    var tree = $('#repo-tree').jstree(true);
+    if (!tree) return;
+
+    // 每次从 jsTree 内部模型重新获取节点，避免引用过期
+    var node = tree.get_node(nodeId);
+    if (!node) return;
+
     if (dirSegments.length === 0) {
         // 所有目录都已展开，当前节点就是目标目录
         $('#' + node.id + ' > .jstree-anchor').trigger('click');
@@ -474,41 +486,48 @@ function _ExpandPathRecursive(node, dirSegments, fileName) {
     }
 
     var targetDir = dirSegments.shift();
-    var tree = $('#repo-tree').jstree(true);
-    if (!tree) return;
 
     // 查找当前节点下匹配 targetDir 的子节点
-    var children = tree.get_node(node).children;
+    var children = tree.get_node(node.id).children;
+    var found = false;
     for (var i = 0; i < children.length; i++) {
         var child = tree.get_node(children[i]);
         if (child && child.text === targetDir) {
+            found = true;
             if (!child.state || !child.state.opened) {
-                // 节点未打开：监听 after_open 事件（一次性）后递归
+                // 节点未打开：监听 after_open 事件后递归
                 var childId = child.id;
-                var timer = setTimeout(function() {
-                    // 超时后自动清理，防止 handler 泄漏
-                    $('#repo-tree').off('after_open.jstree');
-                }, 10000);
                 $('#repo-tree').one('after_open.jstree', function(e, data) {
-                    clearTimeout(timer);
                     if (data.node && data.node.id === childId) {
+                        // after_open 时子节点可能仍在异步加载，延迟后再用 id 重新获取节点
                         setTimeout(function() {
-                            _ExpandPathRecursive(child, dirSegments, fileName);
-                        }, 200);
+                            var freshNode = tree.get_node(childId);
+                            if (freshNode) {
+                                _ExpandPathRecursive(freshNode.id, dirSegments, fileName);
+                            }
+                        }, 300);
                     }
                 });
-                // 触发展开
                 $('#' + child.id + ' > .jstree-anchor').trigger('click');
             } else {
-                // 已打开，直接递归下一级
                 setTimeout(function() {
-                    _ExpandPathRecursive(child, dirSegments, fileName);
-                }, 200);
+                    _ExpandPathRecursive(child.id, dirSegments, fileName);
+                }, 300);
             }
             return;
         }
     }
-    Info('跳转失败: 未找到目录 "' + targetDir + '"');
+    // 未找到：子节点可能还在异步加载中，定期重试直至超时
+    if (!found) {
+        if (retryCount < _EXPAND_RETRY_MAX) {
+            setTimeout(function() {
+                // 重试时重新用 nodeId 获取最新节点数据
+                _ExpandPathRecursive(nodeId, [targetDir].concat(dirSegments), fileName, retryCount + 1);
+            }, 500);
+        } else {
+            Info('跳转失败: 未找到目录 "' + targetDir + '"（已重试 ' + _EXPAND_RETRY_MAX + ' 次）');
+        }
+    }
 }
 
 /**

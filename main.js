@@ -122,6 +122,10 @@ function CreateMenu(){
           ]
         },
         {
+            label: 'Search',
+            click: () => { CallWeb('open-all-repo-search'); }
+        },
+        {
             label: 'Usage',
             click: () => { AlertToWeb(MyFile.SyncRead(path.join(__dirname, 'help/help.html'))); },
         },
@@ -553,23 +557,33 @@ function HandleWebMsg(event, msg){
             },
             // ==================== 仓库文件搜索 ====================
             'check-svn-cache':function(v){
-                // 检查SVN是否已checkout到本地
                 try {
                     var api = g_sys_params.cur_repo_viewer.Api();
-                    var status = api.GetCacheStatus();
-                    CallWeb('svn-cache-status', {cached: !!status, local_path: status ? status.local_path : ''});
+                    var status = api.GetCacheStatus(v ? v.searchPath : null);
+                    // 计算项目根（用于前端 checkout 提示） 
+                    var projectRoot = '';
+                    if (v && v.searchPath) {
+                        projectRoot = api.GetRepoRoot(v.searchPath);
+                    }
+                    CallWeb('svn-cache-status', {
+                        cached: !!status,
+                        local_path: status ? status.local_path : '',
+                        projectRoot: projectRoot,
+                    });
                 } catch (e) {
                     CallWeb('svn-cache-status', {cached: false, local_path: ''});
                 }
             },
             'checkout-svn-repo':async function(v){
                 // 用户确认后确保 SVN 仓库本地就绪（checkout 或 update）
+                // v.searchPath 为搜索路径，用于确定正确的分支 URL
                 var api = g_sys_params.cur_repo_viewer.Api();
                 try {
                     CallWeb('info-on-bg', '正在准备 SVN 本地副本...');
-                    await api.EnsureRepoReady(true);
+                    var targetUrl = api._ExtractBranchRootFromUrl(v ? v.searchPath : null);
+                    await api.EnsureRepoReady(targetUrl);
                     CallWeb('info-on-bg', 'SVN 本地副本就绪');
-                    CallWeb('svn-cache-status', {cached: true, local_path: api.local_path || ''});
+                    CallWeb('svn-cache-status', {cached: true, local_path: ''});
                 } catch (e) {
                     SendErrorToWeb('SVN 准备失败: ' + (e?.message || String(e)));
                     CallWeb('svn-checkout-failed', {error: e?.message || String(e)});
@@ -593,6 +607,21 @@ function HandleWebMsg(event, msg){
                     MyLog.Error('search error: ' + (e?.message || String(e)));
                     CallWeb('show-search-results', {matched: [], error: '搜索失败: ' + (e?.message || String(e))});
                 }
+            },
+            // ==================== 跨仓库搜索 ====================
+            'search-all-repos':function(v){
+                // 搜索所有已缓存仓库的文件
+                // v: {pattern, isRegex}
+                var pattern = RepoSearch.BuildPattern(v.pattern, v.isRegex);
+                if (!pattern) {
+                    CallWeb('show-all-repo-search-results', {matched: [], error: '搜索模式无效', stats: {scanned: 0, found: 0, errors: []}});
+                    return;
+                }
+
+                MyLog.Info('start search all cached repos, pattern: ' + pattern);
+                var result = RepoSearch.SearchCachedRepos(g_sys_params.repo_cache_dir, pattern);
+                MyLog.Info('search all cached repos done, scanned: ' + result.stats.scanned + ', found: ' + result.stats.found);
+                CallWeb('show-all-repo-search-results', result);
             },
         }
         ProcessWebCall[msg.type](value);
@@ -737,8 +766,8 @@ function ScheduleDailyUpdate() {
     const msUntilNext = next - now;
 
     var nextTimeStr = MyDate.GetDateStr(next, true);
-    MyLog.Info(`Daily update scheduled, next run at ${nextTimeStr}`);
-    MyActionLog.Add(`Daily update scheduled, next run at ${nextTimeStr}`, 'info');
+    MyLog.Info(`Daily update check scheduled, next run at ${nextTimeStr}`);
+    MyActionLog.Add(`Daily update check scheduled, next run at ${nextTimeStr}`, 'info');
 
     setTimeout(() => {
         RunDailyUpdate().then(() => {
@@ -753,23 +782,72 @@ function _LockFilePath() {
     return path.join(g_sys_params.local_data_dir, 'scheduler.lock');
 }
 
-function _TryAcquireLock() {
+/**
+ * 原子写入锁文件：先写临时文件，再 rename 覆盖，防止写入过程中崩溃导致锁文件损坏
+ */
+function _AtomicWriteLock(data) {
     const lockFile = _LockFilePath();
+    const tmpFile = lockFile + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(data), 'utf-8');
+    // 重命名（原子操作）
     try {
-        if (fs.existsSync(lockFile)) {
-            const content = fs.readFileSync(lockFile, 'utf-8');
-            const data = JSON.parse(content);
-            const elapsed = Date.now() - (data.heartbeat || 0);
-            if (elapsed < LOCK_STALE_TIMEOUT) {
-                MyLog.Debug(`Scheduler lock held by pid ${data.pid}, heartbeat ${elapsed}ms ago`);
-                return false;
+        fs.renameSync(tmpFile, lockFile);
+    } catch (e) {
+        // rename 失败时尝试直接覆盖（如跨分区问题）
+        fs.copyFileSync(tmpFile, lockFile);
+        fs.unlinkSync(tmpFile);
+    }
+}
+
+/**
+ * 读取并解析锁文件，解析失败时返回 null
+ */
+function _ReadLockFile() {
+    const lockFile = _LockFilePath();
+    if (!fs.existsSync(lockFile)) return null;
+    const content = fs.readFileSync(lockFile, 'utf-8');
+    if (!content) return null;
+    try {
+        return JSON.parse(content);
+    } catch (e) {
+        MyLog.Warn(`Corrupted lock file (${e.message}), treating as stale`);
+        return null;
+    }
+}
+
+/**
+ * 检查 pid 对应的进程是否仍然存活
+ * process.kill(pid, 0) 在跨平台下可用于检测进程存在性
+ */
+function _IsPidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (e) {
+        // ESRCH: no such process, EPERM: exists but no permission (仍存活)
+        return e.code === 'EPERM';
+    }
+}
+
+function _TryAcquireLock() {
+    try {
+        const data = _ReadLockFile();
+        if (data) {
+            // 先检查 pid 对应的进程是否还活着
+            if (data.pid && _IsPidAlive(data.pid)) {
+                const elapsed = Date.now() - (data.heartbeat || 0);
+                if (elapsed < LOCK_STALE_TIMEOUT) {
+                    MyLog.Info(`Scheduler lock held by another instance (pid ${data.pid}, heartbeat ${elapsed}ms ago)`);
+                    return false;
+                }
+                MyLog.Warn(`Found stale scheduler lock (pid ${data.pid}, ${elapsed}ms stale, process alive but heartbeat expired), taking over`);
+            } else {
+                MyLog.Warn(`Found stale scheduler lock (pid ${data.pid} dead), taking over`);
             }
-            MyLog.Warn(`Found stale scheduler lock (pid ${data.pid}, ${elapsed}ms stale), taking over`);
+        } else if (fs.existsSync(_LockFilePath())) {
+            MyLog.Warn('Found corrupted lock file, overwriting');
         }
-        fs.writeFileSync(lockFile, JSON.stringify({
-            pid: process.pid,
-            heartbeat: Date.now(),
-        }), 'utf-8');
+        _AtomicWriteLock({ pid: process.pid, heartbeat: Date.now() });
         return true;
     } catch (e) {
         MyLog.Warn(`Failed to acquire scheduler lock: ${e && e.message ? e.message : e}`);
@@ -779,13 +857,9 @@ function _TryAcquireLock() {
 
 function _ReleaseLock() {
     try {
-        const lockFile = _LockFilePath();
-        if (fs.existsSync(lockFile)) {
-            const content = fs.readFileSync(lockFile, 'utf-8');
-            const data = JSON.parse(content);
-            if (data.pid === process.pid) {
-                fs.unlinkSync(lockFile);
-            }
+        const data = _ReadLockFile();
+        if (data && data.pid === process.pid) {
+            fs.unlinkSync(_LockFilePath());
         }
     } catch (e) {}
 }
@@ -793,11 +867,15 @@ function _ReleaseLock() {
 function _UpdateHeartbeat() {
     if (!g_scheduler_lock) return;
     try {
-        const lockFile = _LockFilePath();
-        const content = fs.readFileSync(lockFile, 'utf-8');
-        const data = JSON.parse(content);
-        data.heartbeat = Date.now();
-        fs.writeFileSync(lockFile, JSON.stringify(data), 'utf-8');
+        var data = _ReadLockFile();
+        if (!data) {
+            // 锁文件缺失或损坏，重新创建
+            MyLog.Warn('Lock file missing or corrupted during heartbeat, re-creating');
+            data = { pid: process.pid, heartbeat: Date.now() };
+        } else {
+            data.heartbeat = Date.now();
+        }
+        _AtomicWriteLock(data);
     } catch (e) {}
 }
 
@@ -809,6 +887,7 @@ function _InitScheduler() {
         g_heartbeat_timer = setInterval(_UpdateHeartbeat, LOCK_HEARTBEAT_INTERVAL);
     } else {
         MyLog.Info('Scheduler lock held by another instance, will check again at run time');
+        MyActionLog.Add('Scheduler lock held by another instance, will check again at run time', 'info');
     }
     ScheduleDailyUpdate();
 }

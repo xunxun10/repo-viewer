@@ -28,7 +28,8 @@ function show_help() {
     echo "Usage: ./dev.sh <command> [options]"
     echo ""
     echo "Commands:"
-    echo "  new       版本号中间位数 +1（如 0.5.2 -> 0.6.0），末尾归零"
+    echo "  new       小版本 +1（如 0.5.2 -> 0.5.3），末位递增"
+    echo "  new major 大版本 +1（如 0.5.2 -> 0.6.0），中间位递增、末位归零"
     echo "  chg       将 change_log.txt 修改时间之后的 git 提交记录追加到最新变更"
     echo "  build     运行 npm run dist 构建"
     echo "  pack      构建并打包为完整安装包（含 tar.gz / zip）"
@@ -51,11 +52,24 @@ function incr_version() {
     local minor=$(echo "$ver" | cut -d. -f2)
     local patch=$(echo "$ver" | cut -d. -f3)
 
-    local new_minor=$((minor + 1))
-    local new_ver="$major.$new_minor.0"
+    if [ "$1" == "major" ]; then
+        local new_minor=$((minor + 1))
+        local new_ver="$major.$new_minor.0"
+        Info "升级大版本（中间位）"
+    else
+        local new_patch=$((patch + 1))
+        local new_ver="$major.$minor.$new_patch"
+        Info "升级小版本（末位）"
+    fi
 
     sed -i "s/\"version\": \"$ver\"/\"version\": \"$new_ver\"/" "$PKG"
     Info "版本号: $ver -> $new_ver"
+
+    # 在 change_log.txt 末尾追加空行和新版本信息
+    local changelog="$S_DIR/change_log.txt"
+    echo "" >> "$changelog"
+    echo "$new_ver" >> "$changelog"
+    Info "已更新 $changelog"
     _elapsed $t_start
 }
 
@@ -72,10 +86,12 @@ function _detect_platform() {
         dist_dir="dist/win-unpacked"
         zip_cmd="$S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip"
         label_file="dist.files.md5.win.txt"
+        platform_suffix="win"
     elif [ `uname -m` == "aarch64" ]; then
         dist_dir="dist/linux-arm64-unpacked"
         zip_cmd="zip -r"
         label_file="dist.files.md5.txt"
+        platform_suffix="linux-arm64"
     else
         Error "不支持的平台";
         exit 1;
@@ -105,7 +121,8 @@ function pack(){
         npm run arm;
         CheckOption "npm run arm 执行失败";
 
-        incr label;
+        # linux同时打出增量包
+        incr;
 
         cd $S_DIR/dist;
 
@@ -132,7 +149,7 @@ function incr(){
          find ./$dist_dir/ -type f | xargs md5sum | sort > "$label_file"
          Info "已生成标签文件: $label_file";
          _elapsed $t_start
-         exit 0
+         return 0
     fi
 
     local new_md5=$(find ./$dist_dir/ -type f | xargs md5sum | sort)
@@ -141,14 +158,14 @@ function incr(){
     if [ "$new_md5" == "$old_md5" ]; then
         Info "文件未变化"
         _elapsed $t_start
-        exit 0
+        return 0
     fi
 
     local incr_dir="./dist/incr"
     local diff_files=$(diff <(echo "$new_md5") <(echo "$old_md5") | grep "^< " | sed -r 's#.*\s\*?./dist#./dist#g')
     Info "文件有变化:\n$diff_files"
 
-    local incr_zip="dist/repo-viewer.$version.incr.zip"
+    local incr_zip="dist/repo-viewer.$version.$platform_suffix.incr.zip"
 
     rm -rf "$incr_dir" "$incr_zip"  && mkdir -p "$incr_dir"
     CheckOption "创建增量目录失败"
@@ -291,7 +308,7 @@ function chg(){
 
 case "$1" in
     new)
-        incr_version
+        incr_version "$2"
         ;;
     chg)
         chg

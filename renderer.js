@@ -116,6 +116,13 @@ if(typeof window.electronAPI != 'undefined'){
                 // SVN checkout 失败时重置搜索状态
                 OnSvnCheckoutFailed(v);
             },
+            // ==================== 跨仓库搜索 ====================
+            "open-all-repo-search":function(v){
+                OpenAllRepoSearchDialog();
+            },
+            "show-all-repo-search-results":function(v){
+                ShowAllRepoSearchResults(v);
+            },
         }
         ProcessSysCall[msg.type](value);
     })
@@ -453,7 +460,7 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
         });
         if(!find_flag){
             // 提示已无数据
-            MyModal.Alert("已到顶");
+            MyModal.Toast("已到顶");
         }
     });
     next_btn.click(()=>{
@@ -477,7 +484,7 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
         });
         if(!find_flag){
             // 提示已无数据
-            MyModal.Alert("已到底");
+            MyModal.Toast("已到底");
         }
     });
     top_btn.click(()=>{
@@ -758,11 +765,10 @@ function ShowRecentRepos(repo_list){
     var html = '';
     for (var i = 0; i < repo_list.length; i++) {
         var url = repo_list[i];
-        // 取最后两级路径作为显示名
-        var parts = url.replace(/\/$/,'').split('/');
-        var display = parts.slice(-2).join('/');
-        if (display.length > 45) {
-            display = '...' + display.slice(-42);
+        // 直接展示完整路径
+        var display = url.replace(/\/$/,'');
+        if (display.length > 60) {
+            display = '...' + display.slice(-57);
         }
         html += `<div class='recent-repos-item' title="${url}" url="${url}">${display}</div>`;
     }
@@ -856,6 +862,208 @@ function ShowActionLogs(logs){
         $('#batch-update-status').show().text('批量更新进行中，请稍候...');
         CallSys('manual-batch-update');
     });
+}
+
+// ==================== 跨仓库文件搜索 ====================
+
+/**
+ * 打开跨仓库搜索对话框
+ */
+function OpenAllRepoSearchDialog() {
+    g_search.isSearching = false;
+
+    var html = `
+    <div class="search-dialog">
+        <div class="search-dialog-input-row">
+            <input type="text" id="all-search-input" class="form-control search-dialog-input" placeholder="输入关键词搜索所有本地缓存的仓库文件" spellcheck="false" />
+            <button id="all-search-btn" class="btn btn-primary btn-sm search-dialog-btn">搜索</button>
+        </div>
+        <div class="search-dialog-options-row">
+            <a href="javascript:void(0)" id="all-search-clear-btn" class="search-dialog-clear-link" title="清空搜索框和搜索结果">清除</a>
+            <label class="search-dialog-regex-label">
+                <input type="checkbox" id="all-search-regex-mode" /> 正则
+            </label>
+            <span id="all-search-status" class="search-dialog-status"></span>
+        </div>
+        <div id="all-search-result-area" class="search-dialog-result-area">
+            <div class="search-dialog-hint">输入关键词后点击"搜索"或按回车，搜索所有本地已缓存的仓库</div>
+        </div>
+        <div class="search-dialog-footer">点击结果项切换到对应仓库，然后在左侧树中展开定位</div>
+    </div>`;
+
+    MyModal.Info(html, '跨仓库搜索', '780px', 'auto', 'search');
+
+    // 绑定事件
+    $('#all-search-btn').off('click').on('click', function() {
+        DoAllRepoSearch();
+    });
+    $('#all-search-input').off('keydown').on('keydown', function(e) {
+        if (e.keyCode === 13) {
+            DoAllRepoSearch();
+        }
+    });
+    $('#all-search-clear-btn').off('click').on('click', function() {
+        $('#all-search-input').val('');
+        $('#all-search-result-area').html('<div class="search-dialog-hint">输入关键词后点击"搜索"或按回车</div>');
+        $('#all-search-status').text('');
+    });
+
+    $('#my-infosearch').off('shown.bs.modal').on('shown.bs.modal', function() {
+        $('#all-search-input').focus();
+    });
+}
+
+/**
+ * 执行跨仓库搜索
+ */
+function DoAllRepoSearch() {
+    if (g_search.isSearching) return;
+
+    var input = $('#all-search-input').val().trim();
+    if (!input) {
+        $('#all-search-status').text('请输入搜索关键词').css('color', '#d93025');
+        return;
+    }
+
+    var isRegex = $('#all-search-regex-mode').is(':checked');
+    g_search.isSearching = true;
+    $('#all-search-btn').prop('disabled', true);
+    $('#all-search-status').text('搜索中...').css('color', '#1a73e8');
+    $('#all-search-result-area').html('<div class="search-dialog-hint">正在搜索所有已缓存的仓库，请稍候...</div>');
+
+    CallSys('search-all-repos', { pattern: input, isRegex: isRegex });
+}
+
+/**
+ * 显示跨仓库搜索结果
+ */
+function ShowAllRepoSearchResults(v) {
+    g_search.isSearching = false;
+    $('#all-search-btn').prop('disabled', false);
+
+    if (v.error) {
+        $('#all-search-status').text(v.error).css('color', '#d93025');
+        $('#all-search-result-area').html('<div class="search-dialog-hint">' + v.error + '</div>');
+        return;
+    }
+
+    var matched = v.matched || [];
+    var stats = v.stats || { scanned: 0, found: 0, errors: [] };
+
+    if (matched.length === 0) {
+        var reason = stats.scanned === 0 ? '没有找到已缓存的仓库' : '未找到匹配的文件';
+        $('#all-search-status').text(reason + ' (扫描 ' + stats.scanned + ' 个仓库)').css('color', '#888');
+        $('#all-search-result-area').html('<div class="search-dialog-hint">' + reason + '</div>');
+        return;
+    }
+
+    $('#all-search-status').text('共 ' + matched.length + ' 条结果 (扫描 ' + stats.scanned + ' 个仓库)').css('color', '#1a73e8');
+
+    // 按 repo_name 分组
+    var grouped = {};
+    for (var i = 0; i < matched.length; i++) {
+        var item = matched[i];
+        if (!grouped[item.repo_name]) {
+            grouped[item.repo_name] = { repo_url: item.repo_url, files: [] };
+        }
+        grouped[item.repo_name].files.push(item);
+    }
+
+    var html = '';
+    var repoNames = Object.keys(grouped);
+    for (var r = 0; r < repoNames.length; r++) {
+        var repoName = repoNames[r];
+        var group = grouped[repoName];
+        html += '<div class="all-repo-search-group"><div class="all-repo-search-repo-name" title="' + group.repo_url + '">[' + repoName + ']</div>';
+        for (var f = 0; f < group.files.length; f++) {
+            var file = group.files[f];
+            html += '<div class="all-repo-search-item" data-repo-url="' + file.repo_url + '" data-path="' + file.path + '" title="' + file.path + '">' + file.path + '</div>';
+        }
+        html += '</div>';
+    }
+
+    $('#all-search-result-area').html(html);
+
+    // 点击结果项：切换到对应仓库
+    $('.all-repo-search-item').off('click').on('click', function() {
+        var repoUrl = $(this).data('repo-url');
+        var filePath = $(this).data('path');
+        // 先关闭搜索对话框
+        $('#my-infosearch').modal('hide');
+        // 切换到对应仓库
+        $('#repo-url').val(repoUrl);
+        $('#access-btn').click();
+        // 延迟等待树加载后展开到对应路径
+        setTimeout(function() {
+            ExpandTreeToPath(filePath);
+        }, 1000);
+    });
+}
+
+/**
+ * 在 jsTree 中按路径逐级展开到目标文件
+ * @param {string} filePath - 如 "src/main/java/Test.java"
+ */
+function ExpandTreeToPath(filePath) {
+    if (!filePath) return;
+    var parts = filePath.split('/');
+    var fileName = parts[parts.length - 1];
+    var expandCount = Math.max(0, parts.length - 1);
+
+    // 等待树就绪后逐级展开目录
+    var retryCount = 0;
+    (function expandStep(idx) {
+        if (!$('#repo-tree').jstree) return;
+        var tree = $('#repo-tree').jstree(true);
+        if (!tree) {
+            if (++retryCount < 10) {
+                setTimeout(function() { expandStep(idx); }, 500);
+            }
+            return;
+        }
+        retryCount = 0;
+
+        if (idx >= expandCount) {
+            // 展开完成，高亮右侧文件列表中的目标文件
+            _HighlightFileInList(fileName);
+            return;
+        }
+
+        // 找到该层级节点并触发点击（模拟正常点击展开，触发 _RefreshNodeChildren 加载子节点）
+        var nodes = tree.get_json('#', { flat: true });
+        for (var i = 0; i < nodes.length; i++) {
+            if (nodes[i].text === parts[idx]) {
+                // 如果节点已打开且已有子节点，直接进入下一级
+                if (nodes[i].state && nodes[i].state.opened && nodes[i].children && nodes[i].children.length > 0) {
+                    setTimeout(function() { expandStep(idx + 1); }, 100);
+                    return;
+                }
+                // 触发点击展开
+                var anchor = $('#' + nodes[i].id + ' > .jstree-anchor');
+                if (anchor.length > 0) {
+                    anchor.trigger('click');
+                    // 等待子节点加载完成后继续（通过监听 before_open + 多次检查）
+                    (function waitForChildren(nodeId, maxWait) {
+                        if (maxWait <= 0) {
+                            setTimeout(function() { expandStep(idx + 1); }, 100);
+                            return;
+                        }
+                        var n = tree.get_node(nodeId);
+                        if (n && n.state && n.state.opened && n.children && n.children.length > 0 &&
+                            tree.get_node(n.children[0]) && tree.get_node(n.children[0]).text) {
+                            // 子节点已加载
+                            setTimeout(function() { expandStep(idx + 1); }, 100);
+                        } else {
+                            setTimeout(function() { waitForChildren(nodeId, maxWait - 1); }, 200);
+                        }
+                    })(nodes[i].id, 30);
+                    return;
+                }
+            }
+        }
+        // 没找到节点，跳过
+        setTimeout(function() { expandStep(idx + 1); }, 100);
+    })(0);
 }
 
 $(function(){

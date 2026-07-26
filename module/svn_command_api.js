@@ -10,6 +10,24 @@ const MyFile = require('../util/my_file');
 
 /**
  * 通过svn命令行工具获取SVN远程仓库的信息，需要确保主机上已经安装svn客户端
+ *
+ * ─── 两个"根"的概念 ───
+ *
+ * 仓库根 (Repo Root)：
+ *   SVN 服务器上的真实仓库根，由 URL 中 /svn/ 后第一级目录决定。
+ *   例如 URL = "http://xlsvn:8888/svn/myapps/easyviptool/trunk"
+ *   → 仓库根 = "http://xlsvn:8888/svn/myapps"
+ *   由 GetRepoTree() 设置在 this.repo_root 上，用于树结构浏览。
+ *
+ * 项目根 (Project Root)：
+ *   用户视角的逻辑项目根，即 trunk/branches/tags 的上一级目录。
+ *   例如 URL = "http://xlsvn:8888/svn/myapps/easyviptool/trunk"
+ *   → 项目根 = "http://xlsvn:8888/svn/myapps/easyviptool"
+ *   由 GetRepoRoot(url) 方法返回，用于缓存 key 和路径计算。
+ *
+ * 缓存以项目根为 key 存储在 this._cacheMap 中：
+ *   projectRoot → { cacheDir, hash }
+ *   同一项目的 trunk 和不同 branches 共享同一缓存目录（通过 svn switch 切换内容）。
  */
 class SvnCommandApi{
     constructor(repo_url, user, password, os_type, cache_root_dir = null) {
@@ -28,104 +46,215 @@ class SvnCommandApi{
         this.password = password;
 
         this.os_type = os_type;
-        this.cache_dir = null;      // 本地缓存根目录（由 InitCache 设置）
-        this.local_path = null;     // checkout 到的本地路径
-
-        // 如果传入了缓存根目录，自动初始化
-        if (cache_root_dir) {
-            this.InitCache(cache_root_dir);
-        }
+        this.cache_root_dir = cache_root_dir;  // 仅保存，不 InitCache
+        this._cacheMap = {};   // projectRoot → { cacheDir, hash }
 
         MyLog.Info(`svn command api init, repo: ${repo_url}, fixed_version: ${this.svn_version}, os type:${this.os_type}`);
     }
 
-    GetCacheStatus(){
-        if (this.local_path && fs.existsSync(this.local_path)) {
-            try {
-                // 检查 .svn 目录是否存在以确认是有效的 checkout
-                const svnDir = path.join(this.local_path, '.svn');
-                if (fs.existsSync(svnDir)) {
-                    return {
-                        local_path: this.local_path,
-                        br_name: path.basename(this.local_path),
-                        up_time: '',
+    /**
+     * 获取缓存状态
+     * @param {string} [searchPath] - 搜索路径，用于检查指定项目根是否有缓存
+     * @returns {object|null}
+     */
+    GetCacheStatus(searchPath){
+        // 有搜索路径时，按项目根精确查找
+        if (searchPath) {
+            const projectRoot = this.GetRepoRoot(searchPath);
+            // 1. 查 _cacheMap 对照表
+            if (this._cacheMap[projectRoot]) {
+                return { local_path: '', br_name: '', up_time: '' };
+            }
+            // 2. 查磁盘上对应项目根的缓存目录
+            if (this.cache_root_dir) {
+                const cacheDir = this._GetCacheDir(projectRoot);
+                if (cacheDir && fs.existsSync(path.join(cacheDir, '.svn'))) {
+                    // 磁盘上有缓存，记录到 _cacheMap 供后续使用
+                    this._cacheMap[projectRoot] = {
+                        cacheDir,
+                        hash: crypto.createHash('md5').update(projectRoot).digest('hex')
                     };
+                    return { local_path: '', br_name: '', up_time: '' };
                 }
-            } catch (e) {
-                MyLog.Warn(`GetCacheStatus error: ${e.message}`);
+            }
+            return null;
+        }
+
+        // 无搜索路径：检查 _cacheMap 是否有任意条目（向后兼容）
+        for (var key in this._cacheMap) {
+            if (this._cacheMap.hasOwnProperty(key)) {
+                return { local_path: '', br_name: '', up_time: '' };
             }
         }
         return null;
     }
 
     /**
-     * 初始化本地缓存目录，按仓库根目录级别创建缓存
-     * @param {string} cache_root_dir - 缓存根目录
+     * 获取项目根对应的缓存目录路径
+     * @param {string} projectRoot - 项目根 URL
+     * @returns {string|null}
      */
-    InitCache(cache_root_dir) {
-        // 使用仓库根目录作为缓存 key，确保同一仓库共用缓存
-        this.repo_root_url = this.GetRepoRoot(this.repo_url);
-        const hash = crypto.createHash('md5').update(this.repo_root_url).digest('hex');
-        this.repo_hash = hash;
-        this.cache_dir = path.join(cache_root_dir, hash + '.svn');
-        this.local_path = this.cache_dir;
-        this.cache_root_dir = cache_root_dir;
-        MyLog.Info(`svn cache init: repo_root=${this.repo_root_url} -> ${this.local_path}`);
-        // 确保缓存目录存在
-        MyFile.MkDir(this.cache_dir);
+    _GetCacheDir(projectRoot) {
+        if (!this.cache_root_dir || !projectRoot) return null;
+        const hash = crypto.createHash('md5').update(projectRoot).digest('hex');
+        return path.join(this.cache_root_dir, hash + '.svn');
     }
 
     /**
-     * 获取仓库根目录 URL（缓存用）
+     * 获取或创建项目根对应的缓存条目（见类注释"两个根的概念"）
+     * @param {string} projectRoot - 项目根 URL（GetRepoRoot 返回值）
+     * @returns {{ cacheDir: string, hash: string }|null}
+     */
+    _GetCacheEntry(projectRoot) {
+        if (!this.cache_root_dir || !projectRoot) return null;
+        if (this._cacheMap[projectRoot]) return this._cacheMap[projectRoot];
+
+        const cacheDir = this._GetCacheDir(projectRoot);
+        if (!cacheDir) return null;
+        MyFile.MkDir(cacheDir);
+
+        const hash = crypto.createHash('md5').update(projectRoot).digest('hex');
+        const entry = { cacheDir, hash };
+        this._cacheMap[projectRoot] = entry;
+        return entry;
+    }
+
+    /**
+     * 获取项目根 URL（parent of trunk/branches/tags）
      */
     GetRepoRootUrl() {
-        if (!this.repo_root_url) {
-            this.repo_root_url = this.GetRepoRoot(this.repo_url);
-        }
-        return this.repo_root_url;
+        return this.GetRepoRoot(this.repo_url);
     }
 
     /**
-     * 确保本地副本就绪：未 checkout 则 checkout，已存在则按需 update
-     * @param {boolean} force - 是否强制更新
+     * 获取分支级 URL（trunk 或 branches/xxx 或 tags/xxx），基于实例的 repo_url
      */
-    async EnsureRepoReady(force = false) {
-        const hasWorkingCopy = this.local_path && fs.existsSync(path.join(this.local_path, '.svn'));
+    _GetBranchRootUrl() {
+        const rootUrl = this.GetRepoRoot(this.repo_url);
+        const remaining = this.repo_url.substring(rootUrl.length);
+        const parts = remaining.replace(/^\//, '').split('/');
+        if (parts.length >= 1) {
+            if (parts[0] === 'trunk') {
+                return rootUrl + '/trunk';
+            }
+            if ((parts[0] === 'branches' || parts[0] === 'tags') && parts.length >= 2) {
+                return rootUrl + '/' + parts[0] + '/' + parts[1];
+            }
+        }
+        return this.repo_url;
+    }
+
+    /**
+     * 从任意 URL 中提取分支级路径（trunk 或 branches/xxx 或 tags/xxx）
+     */
+    _ExtractBranchRootFromUrl(searchUrl) {
+        if (!searchUrl) return this._GetBranchRootUrl();
+        const rootUrl = this.GetRepoRoot(searchUrl);
+        const remaining = searchUrl.substring(rootUrl.length);
+
+        const trunkIdx = remaining.indexOf('/trunk');
+        if (trunkIdx !== -1) {
+            return rootUrl + remaining.substring(0, trunkIdx + '/trunk'.length);
+        }
+
+        const brMatch = remaining.match(/\/branches\/[^/]+/);
+        if (brMatch) {
+            return rootUrl + remaining.substring(0, brMatch.index + brMatch[0].length);
+        }
+
+        const tagMatch = remaining.match(/\/tags\/[^/]+/);
+        if (tagMatch) {
+            return rootUrl + remaining.substring(0, tagMatch.index + tagMatch[0].length);
+        }
+
+        return this._GetBranchRootUrl();
+    }
+
+    /**
+     * 确保本地副本就绪：未 checkout 则 checkout，已存在则按需 update 或 switch
+     * 缓存信息从 _cacheMap 对照表获取
+     * @param {string|null} targetUrl - 目标 checkout URL
+     */
+    async EnsureRepoReady(targetUrl = null) {
+        const checkoutUrl = targetUrl || this._GetBranchRootUrl();
+        const projectRoot = this.GetRepoRoot(checkoutUrl);
+        const cacheEntry = this._GetCacheEntry(projectRoot);
+        if (!cacheEntry) return;
+
+        const localPath = cacheEntry.cacheDir;
+        const hasWorkingCopy = fs.existsSync(path.join(localPath, '.svn'));
         if (!hasWorkingCopy) {
-            await this.CheckoutRepo();
+            await this._CheckoutRepo(checkoutUrl, localPath, projectRoot);
         } else {
-            await this.UpdateRepo(force);
+            const currentUrl = await this._GetWorkingCopyUrl(localPath);
+            if (currentUrl && currentUrl !== checkoutUrl) {
+                MyLog.Info(`svn switch: ${currentUrl} -> ${checkoutUrl}`);
+                await this._GetSvnCommandResult(`switch "${checkoutUrl}" "${localPath}"`).catch(SvnCommandApi._ProcessCommandError);
+                this._SaveLastUpdateTime(projectRoot);
+                this._SaveRepoInfo(projectRoot);
+            } else {
+                await this._UpdateRepo(localPath, projectRoot);
+            }
         }
     }
 
     /**
-     * checkout 仓库根目录到本地
+     * 获取工作副本 URL
+     * @param {string} localPath - 工作副本路径
      */
-    async CheckoutRepo() {
-        if (!this.cache_dir) {
-            throw new Error('svn cache not initialized, call InitCache first');
+    async _GetWorkingCopyUrl(localPath) {
+        try {
+            const res = await this._GetSvnCommandResult(`info --show-item url "${localPath}"`);
+            if (res) return res.trim();
+        } catch (e) {
+            MyLog.Debug(`svn info failed, fallback to entries: ${e.message}`);
         }
-        const rootUrl = this.GetRepoRootUrl();
-        MyLog.Info(`svn checkout repo root: ${rootUrl} -> ${this.local_path}`);
-        await this._GetSvnCommandResult(`checkout "${rootUrl}" "${this.local_path}"`).catch(SvnCommandApi._ProcessCommandError);
-        // 记录更新时间
-        this._SaveLastUpdateTime();
-        MyLog.Info(`svn checkout completed: ${this.local_path}`);
+        const entriesPath = path.join(localPath, '.svn', 'entries');
+        if (fs.existsSync(entriesPath)) {
+            try {
+                const content = fs.readFileSync(entriesPath, 'utf8');
+                const lines = content.split('\n');
+                if (lines.length > 0 && lines[0].trim()) {
+                    return lines[0].trim();
+                }
+            } catch (e) {
+                MyLog.Debug(`read svn entries failed: ${e.message}`);
+            }
+        }
+        return null;
     }
 
     /**
-     * 更新本地副本：距上次更新超过 1 天时执行 svn update
-     * @param {boolean} force - 是否强制更新
+     * Checkout 指定 URL 到本地缓存
+     * @param {string} url - checkout 目标 URL
+     * @param {string} localPath - 本地路径
+     * @param {string} projectRoot - 项目根 URL
      */
-    async UpdateRepo(force = false) {
-        if (!this.local_path || !fs.existsSync(this.local_path)) return;
+    async _CheckoutRepo(url, localPath, projectRoot) {
+        MyLog.Info(`svn checkout: ${url} -> ${localPath}`);
+        await this._GetSvnCommandResult(`checkout "${url}" "${localPath}"`).catch(SvnCommandApi._ProcessCommandError);
+        this._SaveLastUpdateTime(projectRoot);
+        this._SaveRepoInfo(projectRoot);
+        MyLog.Info(`svn checkout completed: ${localPath}`);
+    }
 
-        // 检查上次更新时间
-        const lastUpdateFile = path.join(this.cache_root_dir, this.repo_hash + '.last-update');
-        if (!force && fs.existsSync(lastUpdateFile)) {
+    /**
+     * 更新本地副本
+     * @param {string} localPath - 本地路径
+     * @param {string} projectRoot - 项目根 URL
+     */
+    async _UpdateRepo(localPath, projectRoot) {
+        if (!localPath || !fs.existsSync(localPath)) return;
+
+        const entry = this._cacheMap[projectRoot];
+        if (!entry) return;
+        const lastUpdateFile = path.join(this.cache_root_dir, entry.hash + '.last-update');
+        const now = new Date();
+
+        // 检查上次更新时间（默认跳过 24 小时内）
+        if (fs.existsSync(lastUpdateFile)) {
             const lastUpdateContent = fs.readFileSync(lastUpdateFile, 'utf-8').trim();
             const lastUpdateTime = new Date(lastUpdateContent);
-            const now = new Date();
             const diffHours = (now - lastUpdateTime) / (1000 * 60 * 60);
             if (diffHours < 24) {
                 MyLog.Debug(`svn update skipped, last update was ${diffHours.toFixed(1)} hours ago`);
@@ -133,18 +262,39 @@ class SvnCommandApi{
             }
         }
 
-        MyLog.Info(`svn update: ${this.local_path}`);
-        await this._GetSvnCommandResult(`update "${this.local_path}"`).catch(SvnCommandApi._ProcessCommandError);
-        this._SaveLastUpdateTime();
-        MyLog.Info(`svn update completed: ${this.local_path}`);
+        MyLog.Info(`svn update: ${localPath}`);
+        await this._GetSvnCommandResult(`update "${localPath}"`).catch(SvnCommandApi._ProcessCommandError);
+        this._SaveLastUpdateTime(projectRoot);
+        this._SaveRepoInfo(projectRoot);
+        MyLog.Info(`svn update completed: ${localPath}`);
+    }
+
+    /**
+     * 保存仓库 URL 到 info 文件
+     * @param {string} projectRoot - 项目根 URL
+     */
+    _SaveRepoInfo(projectRoot) {
+        const entry = this._cacheMap[projectRoot];
+        if (!entry) return;
+        try {
+            const infoFile = path.join(this.cache_root_dir, entry.hash + '.info');
+            if (!fs.existsSync(infoFile)) {
+                fs.writeFileSync(infoFile, projectRoot);
+            }
+        } catch (e) {
+            MyLog.Warn(`save svn repo info failed: ${e.message}`);
+        }
     }
 
     /**
      * 保存上次更新时间
+     * @param {string} projectRoot - 项目根 URL
      */
-    _SaveLastUpdateTime() {
+    _SaveLastUpdateTime(projectRoot) {
+        const entry = this._cacheMap[projectRoot];
+        if (!entry) return;
         try {
-            const lastUpdateFile = path.join(this.cache_root_dir, this.repo_hash + '.last-update');
+            const lastUpdateFile = path.join(this.cache_root_dir, entry.hash + '.last-update');
             fs.writeFileSync(lastUpdateFile, new Date().toISOString());
         } catch (e) {
             MyLog.Warn(`save last update time failed: ${e.message}`);
@@ -154,15 +304,17 @@ class SvnCommandApi{
     /**
      * 从本地 checkout 目录递归列出所有文件
      * @param {string} relativePath - 相对路径
+     * @param {string} projectRoot - 项目根 URL（从对照表取缓存目录）
      * @returns {Promise<Array>} 文件列表 [{text, path, size, date}]
      */
-    async GetLocalFileList(relativePath = '') {
-        if (!this.local_path) {
-            throw new Error('svn not checked out locally');
+    async GetLocalFileList(relativePath = '', projectRoot) {
+        const cacheEntry = this._cacheMap[projectRoot];
+        if (!cacheEntry) {
+            throw new Error('svn cache not initialized for project root: ' + projectRoot);
         }
         const searchPath = relativePath
-            ? path.join(this.local_path, relativePath)
-            : this.local_path;
+            ? path.join(cacheEntry.cacheDir, relativePath)
+            : cacheEntry.cacheDir;
         const files = [];
         await this._walkDirAsync(searchPath, files, '');
         return files;
@@ -213,19 +365,26 @@ class SvnCommandApi{
      * @returns {Promise<{matched: array}>}
      */
     async SearchFiles(searchUrl, pattern) {
-        await this.EnsureRepoReady();
-        const repoRootUrl = this.GetRepoRootUrl();
+        // 1. 从搜索路径提取分支级 URL，切换缓存到该级
+        const targetUrl = this._ExtractBranchRootFromUrl(searchUrl);
+        const projectRoot = this.GetRepoRoot(targetUrl);
+        await this.EnsureRepoReady(targetUrl);
+
+        // 2. 相对路径从 targetUrl 算（缓存 switch 后的实际文件层级）
         let relativePath = '';
-        if (searchUrl.startsWith(repoRootUrl)) {
-            relativePath = searchUrl.substring(repoRootUrl.length + 1);
+        if (searchUrl.startsWith(targetUrl)) {
+            relativePath = searchUrl.substring(targetUrl.length + 1);
         }
+
         const RepoSearch = require('./repo_search');
-        return RepoSearch.SearchInSvn(this, relativePath, pattern);
+        return RepoSearch.SearchInSvn(this, relativePath, pattern, projectRoot);
     }
 
     /**
-     * 获取repo根目录，即trunk、branches、tags的上一级目录
+     * 获取项目根（Project Root），即 trunk/branches/tags 的上一级目录。
+     * 与 this.repo_root（仓库根/Repo Root）不同，详见类注释"两个根的概念"。
      * @param {*} repo_url 
+     * @returns {string} 项目根 URL
      */
     GetRepoRoot(repo_url){
         // 找到第一个trunk等目录位置，返回上级目录
@@ -343,7 +502,7 @@ class SvnCommandApi{
         for(let i = 0; i < entries.length; i++){
             let entry = entries[i];
             let kind = entry['@kind'];
-            let name = entry.name;
+            let name = entry.name != null ? String(entry.name) : '';
             let commit = entry.commit;
             let revision = commit['@revision'];
             let author = commit.author;
@@ -386,7 +545,8 @@ class SvnCommandApi{
         let res_obj = SvnCommandApi._ParseRepoTree(res);
         res_obj.url = repo_url;
 
-        // 计算base及path，保持与webdav接口一致，base为仓库根目录（以/svn/分割），path为根目录下的剩余路径
+        // 计算仓库根（Repo Root）：/svn/ 后第一级目录为仓库根，与项目根（Project Root）不同
+        // 见类注释"两个根的概念"
         var idx = repo_url.indexOf('/svn/');
         var base_and_path = repo_url.substring(idx + 5).split('@')[0].split('/');
         res_obj.base = base_and_path[0];   // base_and_path第一个目录
@@ -396,7 +556,7 @@ class SvnCommandApi{
             // 服务器根目录为url中/svn/之前的部分
             let idx = repo_url.indexOf('/svn/');
             this.server_root = repo_url.substring(0, idx);
-            this.repo_root = this.server_root + "/svn/" + res_obj.base;
+            this.repo_root = this.server_root + "/svn/" + res_obj.base;  // 仓库根（Repo Root）
 
             MyLog.Info(`repo info init, repo url: ${repo_url}, server root: ${this.server_root}, repo_root: ${this.repo_root}`);  // TODO debug
         }

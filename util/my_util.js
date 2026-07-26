@@ -355,7 +355,12 @@ var MyModal = class {
             </div>`;
             $("body").append($(modal));
             // 避免点击背景时退出, esc依然退出，不取消右上角关闭按钮
-            $("#my-info").modal({backdrop: 'static', keyboard: true});
+            var $modal = $("#my-info" + id_str);
+            $modal.modal({backdrop: 'static', keyboard: true});
+            // 弹框隐藏时自动从 DOM 中移除，避免残留影响后续操作
+            $modal.off('hidden.bs.modal').on('hidden.bs.modal', function() {
+                $modal.remove();
+            });
         }
         $("#my-info-label" + id_str).text(title);
         $("#my-info-content" + id_str).html(content);
@@ -385,6 +390,10 @@ var MyModal = class {
             $("body").append($(modal));
             // 避免点击时退出,esc依然退出
             $("#my-alert").modal({backdrop: 'static', keyboard: true});
+            // 弹框隐藏时自动从 DOM 中移除
+            $("#my-alert").off('hidden.bs.modal').on('hidden.bs.modal', function() {
+                $(this).remove();
+            });
         }
         $("#my-alert-label").text(title);
         $("#my-alert-content").html(content);
@@ -431,6 +440,10 @@ var MyModal = class {
             $("body").append($(modal));
             // 避免点击及esc时退出
             $("#my-confirm").modal({backdrop: 'static', keyboard: false});
+            // 弹框隐藏时自动从 DOM 中移除
+            $("#my-confirm").off('hidden.bs.modal').on('hidden.bs.modal', function() {
+                $(this).remove();
+            });
         }
         $("#my-confirm-label").text(title);
         $("#my-confirm-content").html(content);
@@ -483,6 +496,26 @@ var MyModal = class {
             modal_dialog.css({'margin': m_top + 'px auto'});
             modal_dialog.css({'max-height': win_height - 100 + 'px', 'max-width': win_width - 100 + 'px'});
         }, 200);
+    }
+
+    /**
+     * 显示渐隐提示 Toast
+     * @param {string} text 提示文本
+     * @param {number} duration 显示时长（毫秒），默认2000
+     */
+    static Toast(text, duration=2000) {
+        var $toast = $('<div class="toast-notification">' + text + '</div>');
+        $('body').append($toast);
+        // 强制回流以触发过渡
+        $toast[0].offsetHeight;
+        $toast.addClass('show');
+        setTimeout(function() {
+            $toast.removeClass('show');
+            // 等过渡动画结束后移除元素
+            setTimeout(function() {
+                $toast.remove();
+            }, 300);
+        }, duration);
     }
 }
 
