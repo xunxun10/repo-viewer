@@ -81,27 +81,50 @@ function incr_version() {
 
 function build(){
     local t_start=$(date +%s)
-    Info "Running: npm run dist"
-    cd "$S_DIR"/dist &&  rm -rf repo-viewer* repo-viewer-win32-x64*.tar.gz repo-viewer-win32-x64*.zip repo-viewer-win32-x64;
-    cd "$S_DIR" && npm run dist;
-    _elapsed $t_start "构建"
-}
-
-function _detect_platform() {
-    if [ `uname -m` == "x86_64" ]; then
-        dist_dir="dist/win-unpacked"
-        zip_cmd="$S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip"
-        label_file="dist.files.md5.win.txt"
-        platform_suffix="win32-x64"
-    elif [ `uname -m` == "aarch64" ]; then
-        dist_dir="dist/linux-arm64-unpacked"
-        zip_cmd="zip -r"
-        label_file="dist.files.md5.txt"
-        platform_suffix="linux-arm64"
-    else
+    local arch=$(_detect_arch)
+    if [ "$arch" == "unknown" ]; then
         Error "不支持的平台";
         exit 1;
     fi
+    if [ "$arch" == "arm64" ]; then
+        Info "目标平台: linux-arm64，执行 npm run arm 构建 ..."
+        mkdir -p "$S_DIR"/dist
+        cd "$S_DIR" && npm run arm;
+    else
+        Info "目标平台: win32-x64，执行 npm run dist 构建 ..."
+        mkdir -p "$S_DIR"/dist && cd "$S_DIR"/dist &&  rm -rf repo-viewer* repo-viewer-win32-x64*.tar.gz repo-viewer-win32-x64*.zip repo-viewer-win32-x64;
+        cd "$S_DIR" && npm run dist;
+    fi
+    _elapsed $t_start "构建"
+}
+
+function _detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)            echo "x64" ;;
+        aarch64|arm64|armv8*)    echo "arm64" ;;
+        *)                       echo "unknown" ;;
+    esac
+}
+
+function _detect_platform() {
+    case "$(_detect_arch)" in
+        x64)
+        dist_dir="dist/win-unpacked"
+        zip_cmd="$S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip -bso0 -bsp0"
+        label_file="dist.files.md5.win.txt"
+        platform_suffix="win32-x64"
+        ;;
+        arm64)
+        dist_dir="dist/linux-arm64-unpacked"
+        zip_cmd="zip -rq"
+        label_file="dist.files.md5.txt"
+        platform_suffix="linux-arm64"
+        ;;
+        *)
+        Error "不支持的平台";
+        exit 1;
+        ;;
+    esac
 }
 
 function pack(){
@@ -111,7 +134,8 @@ function pack(){
     local split_size="99m"
     local zip_split_num=99
 
-    if [ `uname -m` == "x86_64" ]; then
+    case "$(_detect_arch)" in
+        x64)
         Info "开始执行 npm dist 打包命令 ...";
         npm run dist;
         CheckOption "npm run dist 执行失败";
@@ -121,11 +145,12 @@ function pack(){
         Info "开始将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip（按 ${split_size} 分片） ...";
         rm -rf repo-viewer-win32-x64*.tar.gz repo-viewer-win32-x64*.zip repo-viewer-win32-x64*.z[0-9][0-9] repo-viewer-win32-x64;
         cp -rfa win-unpacked repo-viewer-win32-x64 && 
-            $S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip repo-viewer-win32-x64-$version.zip repo-viewer-win32-x64 -v${split_size} &&
+            $S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip -bso0 -bsp0 repo-viewer-win32-x64-$version.zip repo-viewer-win32-x64 -v${split_size} &&
             rm -rf repo-viewer-win32-x64 &&
             Info "已经成功将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip（最大 ${split_size} 分片）";
         CheckOption "打包失败";
-    elif [ `uname -m` == "aarch64" ]; then
+        ;;
+        arm64)
         Info "开始执行 npm run arm 打包命令 ...";
         npm run arm;
         CheckOption "npm run arm 执行失败";
@@ -133,14 +158,19 @@ function pack(){
         Info "开始将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip（按 ${split_size} 分片） ...";
         cd $S_DIR/dist && rm -rf *.AppImage *.tar.gz *.zip *.z[0-9][0-9] repo-viewer-linux-arm64;
         mv linux-arm64-unpacked repo-viewer-linux-arm64 && 
-            zip -r -s ${zip_split_num}m repo-viewer-linux-arm64-$version.zip repo-viewer-linux-arm64 &&
+            zip -rq -s ${zip_split_num}m repo-viewer-linux-arm64-$version.zip repo-viewer-linux-arm64 &&
             mv repo-viewer-linux-arm64 linux-arm64-unpacked &&
             Info "已经成功将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip 及分片文件";
         CheckOption "打包失败";
 
         # linux同时打出增量包
         incr;
-    fi
+        ;;
+        *)
+        Error "不支持的平台";
+        exit 1;
+        ;;
+    esac
 
     _elapsed $t_start "pack"
 }
