@@ -17,6 +17,8 @@ class GitCommandApi {
         this.os_type = os_type;
         this.cache_dir = cache_dir;
         this.submodule_path_dict = null;
+        this._branchDiffCache = {};   // `${base}|${target}` → { time, data }，短期缓存分支比对摘要，避免切换目标分支重复解析
+        this._forkBaseCache = {};   // `${target}|${base}` → merge-base 提交hash，拉分支点固定，缓存复用
 
         // repo_url必须以.git结尾
         if (!repo_url.endsWith('.git')) {
@@ -786,6 +788,91 @@ class GitCommandApi {
     }
 
     /**
+     * 获取 .gitmodules 中所有子模块信息
+     * @returns {object} key为子模块路径，value为 {url, branch, commit}
+     */
+    async _ParseSubmodules() {
+        let result = {};
+        try {
+            // 纯 git 命令解析 .gitmodules，避免依赖 git-bash 环境
+            const text = await this._GetGitCommandResult(`config --file .gitmodules -l`, this.repo_path, false);
+            const entries = {};
+            String(text).split('\n').forEach(line => {
+                const eq = line.indexOf('=');
+                if (eq < 0) return;
+                const key = line.slice(0, eq).trim();
+                const val = line.slice(eq + 1).trim();
+                const m = key.match(/^submodule\.([^=]+)\.(path|url|branch)$/);
+                if (!m) return;
+                entries[m[1]] = entries[m[1]] || {};
+                entries[m[1]][m[2]] = val;
+            });
+            Object.values(entries).forEach(info => {
+                if (info.path) {
+                    result[info.path] = { url: info.url || '', branch: info.branch || 'N/A', commit: '' };
+                }
+            });
+            // 从 git ls-files -s 中提取当前跟踪的子模块提交号(gitlink)
+            const lsRes = await this._GetGitCommandResult(`ls-files -s`, this.repo_path, false);
+            String(lsRes).split('\n').forEach(line => {
+                const m = String(line).trim().match(/^160000\s+([0-9a-f]+)\s+\d+\s+(.+)$/);
+                if (m && result[m[2]]) {
+                    result[m[2]].commit = m[1];
+                }
+            });
+        } catch (error) {
+            MyLog.Warn(`解析子模块列表失败: ${error.message}`);
+        }
+        return result;
+    }
+
+    /**
+     * 判断某版本下指定路径是否为子模块(git 外链, gitlink)
+     */
+    async _IsSubmoduleAt(version, filePath) {
+        try {
+            const res = await this._GetGitCommandResult(`ls-tree ${version} -- "${filePath}"`, this.repo_path, false);
+            return /^160000\s+commit\s/.test(String(res).trim());
+        } catch (error) {
+            return false;
+        }
+    }
+
+    /**
+     * 获取某版本下子模块指向的提交号
+     */
+    async _GetSubmoduleCommitAt(version, filePath) {
+        try {
+            const res = await this._GetGitCommandResult(`ls-tree ${version} -- "${filePath}"`, this.repo_path, false);
+            const m = String(res).trim().match(/^160000\s+commit\s+([0-9a-f]+)/);
+            return m ? m[1] : '';
+        } catch (error) {
+            return '';
+        }
+    }
+
+    /**
+     * 获取子模块在两个版本间的指针(提交号)变化，代替无意义的文本 diff
+     */
+    async _GetSubmodulePointerDiff(filePath, begin, end) {
+        const subs = await this._ParseSubmodules();
+        const info = subs[filePath] || { url: '(未知)', branch: 'N/A' };
+        const oldCommit = begin ? await this._GetSubmoduleCommitAt(begin, filePath) : '';
+        const newCommit = end ? await this._GetSubmoduleCommitAt(end, filePath) : '';
+        const format = (tag, commit) =>
+`Path: ${filePath}
+URL: ${info.url}
+Branch: ${info.branch}
+CommitID(${tag}): ${commit || '(未知)'}
+`;
+        return {
+            title: `${filePath} 子模块指针变更`,
+            pre: format('旧版本', oldCommit),
+            new: format('新版本', newCommit),
+        };
+    }
+
+    /**
      * 获取两个版本及其之间的变更差异
      * @param {*} file_url 
      * @param {*} begin 注意，需要获取的变更包含begin版本的提交
@@ -797,6 +884,11 @@ class GitCommandApi {
         var begin_title = '', end_title = '';
         const [branchType, branch, filePath] = this._ExtractBranchFromUrl(file_url);
         await this._CloneOrUpdateRepo(branchType, branch, filePath);
+        // 子模块(git 外链)不做文本 diff，展示其指针(提交号)变化
+        const bindRef = end || begin;
+        if (bindRef && await this._IsSubmoduleAt(bindRef, filePath)) {
+            return await this._GetSubmodulePointerDiff(filePath, begin, end);
+        }
         if(begin){
             // pre_version 为begin的上一个版本号，注意需要去除空行及空格
             var begin = await this._GetPreVersion(begin, filePath);
@@ -823,6 +915,171 @@ class GitCommandApi {
         let pre_prop = await this.GetRepoProperty(file_url, begin);
         let new_prop = await this.GetRepoProperty(file_url, end);
         return { title: `${file_url} ${begin}:${end}`, pre: pre_prop, new: new_prop };
+    }
+
+    /**
+     * 获取可进行分支比对的分支列表（含默认主线 main/master 及其余远端分支）
+     * @param {string} selUrl 当前选中的仓库路径
+     * @returns {Promise<{baseRoot, baseBranchName, defaultBranch, branches:[{name,url}]}>}
+     */
+    async GetBranchList(selUrl){
+        if(!fs.existsSync(this.repo_path)){
+            await this._CloneOrUpdateRepo('master', 'master', '');
+        }
+        // 当前分支：本地工作副本 HEAD 即当前树上展示的分支
+        let baseBranchName = 'master';
+        try {
+            const head = (await this._GetGitCommandResult(`rev-parse --abbrev-ref HEAD`, this.repo_path, false)).trim();
+            if(head && head !== 'HEAD'){ baseBranchName = head; }
+        } catch(e) {}
+
+        // 所有远端分支（去除 origin/HEAD 及 origin/xxx -> 解析行）
+        let res = '';
+        try { res = await this._GetGitCommandResult(`branch -r`, this.repo_path, false); } catch(e) { res = ''; }
+        const names = String(res).split('\n')
+            .map(l => l.trim())
+            .filter(l => l && l.indexOf('origin/HEAD') === -1 && l.indexOf('->') === -1)
+            .map(l => l.replace(/^origin\//, ''));
+
+        const seen = {};
+        const branches = [];
+        // 默认主线优先
+        let defaultBranch = await this._GetDefaultBranch();
+        if(defaultBranch && !seen[defaultBranch]){
+            branches.push({ name: defaultBranch, url: defaultBranch });
+            seen[defaultBranch] = true;
+        }
+        for(const n of names){
+            if(n && !seen[n]){ branches.push({ name: n, url: n }); seen[n] = true; }
+        }
+        // 若当前分支未在列表（如 detached HEAD），补到最前
+        if(!seen[baseBranchName]){
+            branches.unshift({ name: baseBranchName, url: baseBranchName });
+        }
+
+        // 若当前分支名含 _rf_，默认与去掉 _rf_ 及之后内容的分支比对；该分支不存在则退回主线
+        if(baseBranchName.indexOf('_rf_') !== -1){
+            const parentName = baseBranchName.split('_rf_')[0];
+            if(seen[parentName]){ defaultBranch = parentName; }
+        }
+
+        return {
+            baseRoot: baseBranchName,
+            baseBranchName,
+            defaultBranch: defaultBranch || baseBranchName,
+            branches
+        };
+    }
+
+    /**
+     * 比对两个分支，返回变更文件列表
+     * 目标/源均用远端 ref（origin/<分支>）以保证 ref 一定存在
+     * @param {string} baseRoot 源分支名
+     * @param {string} targetRoot 目标分支名
+     * @returns {Promise<Array>} [{status, path, baseUrl, targetUrl}]，url 形如 "分支:路径"
+     */
+    async CompareBranches(baseRoot, targetRoot, compareMode = 'base'){
+        if(!fs.existsSync(this.repo_path)){
+            await this._CloneOrUpdateRepo('master', 'master', '');
+        }
+        // 目标分支(如main)作为"源"/基线，当前分支作为"新"
+        // compareMode: 'base'=与目标分支拉分支时的merge-base提交比对(默认); 'latest'=与目标分支最新版比对
+        const latest = compareMode === 'latest';
+        const forkBase = latest ? `origin/${targetRoot}` : (await this._ResolveForkBase(targetRoot, baseRoot));
+
+        const cacheKey = latest
+            ? `${baseRoot}|${targetRoot}|latest`
+            : `${baseRoot}|${targetRoot}|base@${forkBase || 'HEAD'}`;
+        const hit = this._branchDiffCache[cacheKey];
+        const MAX_AGE = 60 * 1000;
+        if(hit && (Date.now() - hit.time) < MAX_AGE){ return hit.data; }
+
+        const res = await this._GetGitCommandResult(`diff --name-status --find-renames=80% "${forkBase}" "origin/${baseRoot}"`, this.repo_path, false)
+            .catch(e => { throw new Error(e); });
+        const data = GitCommandApi._ParseNameStatus(res, targetRoot, baseRoot);
+        // base 模式下，旧/源侧固定到 merge-base 提交，文件级 diff 据此取拉分支时的内容
+        if(!latest && forkBase){
+            const prefix = targetRoot + ':';
+            for(const it of data){
+                if(it.baseUrl && it.baseUrl.indexOf(prefix) === 0){
+                    it.baseUrl = forkBase + it.baseUrl.substring(prefix.length);
+                }
+            }
+        }
+        this._branchDiffCache[cacheKey] = { time: Date.now(), data };
+        return data;
+    }
+
+    /**
+     * 解析当前分支相对目标分支的拉分支提交（merge-base），即目标分支在拉分支时的版本
+     */
+    async _ResolveForkBase(targetRoot, baseRoot){
+        const key = `${targetRoot}|${baseRoot}`;
+        if(this._forkBaseCache[key]){ return this._forkBaseCache[key]; }
+        let base = null;
+        try{
+            const out = await this._GetGitCommandResult(`merge-base "origin/${targetRoot}" "origin/${baseRoot}"`, this.repo_path, false);
+            base = String(out || '').trim();
+        }catch(e){ base = null; }
+        this._forkBaseCache[key] = base;
+        return base;
+    }
+
+    /**
+     * 解析 git diff --name-status 输出为变更文件列表
+     * 注意：调用时已按「目标分支为源」交换传参，故本函数中 baseRoot 实为"旧/源"侧、targetRoot 实为"新"侧
+     * @param {string} text
+     * @param {string} baseRoot 旧/源侧分支名（传入的 targetRoot）
+     * @param {string} targetRoot 新侧分支名（传入的 baseRoot）
+     */
+    static _ParseNameStatus(text, baseRoot, targetRoot){
+        const list = [];
+        const lines = String(text || '').split(/\r?\n/);
+        for(const ln of lines){
+            if(!ln.trim()) continue;
+            // git diff --name-status 使用 TAB 分隔，避免文件名含空格时解析错误
+            const parts = ln.split('\t');
+            const st = parts[0] || '';
+            let status = st.replace(/R\d+/, 'R').replace(/C\d+/, 'C');
+            if(!status) continue;
+
+            let path, baseUrl, targetUrl;
+            if(status === 'R' || status === 'C'){
+                // 重命名/复制: R<num>\told_path\tnew_path
+                const oldPath = parts[1] || '';
+                const newPath = parts[2] || oldPath;
+                path = newPath;
+                baseUrl = `${baseRoot}:${oldPath}`;
+                targetUrl = `${targetRoot}:${newPath}`;
+            }else{
+                path = parts.slice(1).join('\t');
+                baseUrl = `${baseRoot}:${path}`;
+                targetUrl = `${targetRoot}:${path}`;
+            }
+            if(!path) continue;
+            list.push({ status, path, baseUrl, targetUrl });
+        }
+        return list;
+    }
+
+    /**
+     * 获取单个文件的跨分支差异内容（两侧取各自分支 HEAD）
+     * @param {string} baseUrl 源分支 url，形如 "分支:路径"，可为空字符串
+     * @param {string} targetUrl 目标分支 url，形如 "分支:路径"，可为空字符串
+     * @returns {Promise<{title, pre, new}>}
+     */
+    async GetBranchFileDiff(baseUrl, targetUrl){
+        if(!fs.existsSync(this.repo_path)){
+            await this._CloneOrUpdateRepo('master', 'master', '');
+        }
+        let pre = '', new_content = '';
+        if(baseUrl){
+            try { pre = await this._GetGitCommandResult(`show "${baseUrl}"`, this.repo_path, false); } catch(e){ pre = ''; }
+        }
+        if(targetUrl){
+            try { new_content = await this._GetGitCommandResult(`show "${targetUrl}"`, this.repo_path, false); } catch(e){ new_content = ''; }
+        }
+        return { title: `${baseUrl || '(none)'} ↔ ${targetUrl || '(none)'}`, pre: pre, new: new_content };
     }
 
     // 自动检测 Git Bash 路径

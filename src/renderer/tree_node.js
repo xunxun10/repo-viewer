@@ -18,7 +18,7 @@ function _CreateRepoTreeNode(repo){
         'plugins': ['contextmenu'],
         'contextmenu': {
             'items': function (node) {
-                return {
+                var items = {
                     // 自定义菜单项
                     "showlog": {
                         "separator_before": false,
@@ -75,10 +75,24 @@ function _CreateRepoTreeNode(repo){
                             SetSelectNode(node);
                             OpenSearchDialog(_GetSelPath());
                         }
-                    },
-                    // 每次展开都会刷新子节点信息，因此不需要刷新菜单
-                    // 其他菜单项...
+                    }
                 };
+                // 分支比对（Git 与 SVN 均支持），仅位于 branches/分支名 下的节点显示
+                if(_IsBranchSubNode(node)){
+                    items["compare-branch"] = {
+                        "separator_before": true,
+                        "separator_after": false,
+                        "label": "compare branch",
+                        "action": function (obj) {
+                            $('.repo-file.click-node').removeClass('active');
+                            SetSelectNode(node);
+                            CallSys('get-branch-list', _GetSelPath());
+                        }
+                    };
+                }
+                // 每次展开都会刷新子节点信息，因此不需要刷新菜单
+                // 其他菜单项...
+                return items;
             }
         }
     }
@@ -172,6 +186,20 @@ function _GetBrName(repo_file_url){
     }
     
     return 'master'; // 默认分支名
+}
+
+// 判断节点是否位于 branches/分支名 之下（trunk/主线、branches分组列表、tags均不算）
+function _IsBranchSubNode(node){
+    if(!node){ return false; }
+    var chain = [node];
+    var cur = node;
+    while(cur && cur.parent && cur.parent != '#'){
+        cur = $('#repo-tree').jstree('get_node', "#" + cur.parent);
+        chain.unshift(cur);
+    }
+    var texts = chain.map(function(n){ return n ? n.text : ''; });
+    var idx = texts.indexOf('branches');
+    return idx !== -1 && idx + 1 < texts.length;
 }
 
 // 如果当前repo使用缓存，并且当前选中节点与前一节点分支名不同，则强制刷新，避免切换分支后异常
@@ -336,12 +364,23 @@ function _AutoOpenDefaultBranch() {
         var tree = $('#repo-tree').jstree(true);
         if (!tree) return;
         var children = tree.get_node('#').children;
+
+        // 优先选择 trunk、master、main，其次才回退到第一个非 branches/tags 的节点
+        var priority = ['trunk', 'master', 'main'];
+        var fallback = null;
+        var selected = null;
         for (var i = 0; i < children.length; i++) {
             var node = tree.get_node(children[i]);
-            if (node && node.text !== 'branches' && node.text !== 'tags') {
-                $('#' + node.id + ' > .jstree-anchor').trigger('click');
+            if (!node || node.text === 'branches' || node.text === 'tags') continue;
+            if (!fallback) fallback = node;
+            if (priority.indexOf(node.text) !== -1) {
+                selected = node;
                 break;
             }
+        }
+        var target = selected || fallback;
+        if (target) {
+            $('#' + target.id + ' > .jstree-anchor').trigger('click');
         }
     });
 }

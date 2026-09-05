@@ -1,6 +1,5 @@
 const MyLog = require('../util/my_log')
 const {MyString} = require('../util/my_util')
-const SvnWebApi = require('./svn_web_api')
 const SvnCommandApi = require('./svn_command_api')
 const GitCommandApi = require('./git_command_api');
 

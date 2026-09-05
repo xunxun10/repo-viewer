@@ -15,6 +15,7 @@ const MyOs = require('./util/my_os')
 const MyActionLog = require('./util/my_action_log')
 const { MenuIcon } = require('./util/menu_icons')
 const PasswordEncrypt = require('./util/password_encrypt')
+const RepoUrl = require('./util/repo_url')
 
 const is_mac = process.platform === 'darwin'
 const is_windows = process.platform === 'win32';
@@ -44,8 +45,7 @@ var g_sys_params = {
     config_file_name: 'sys.conf',
     tmp_dir: '',
     db_file: null,
-    user: "",
-    password: "",
+    credentials: {},   // 按主机:端口绑定的凭据内存态：{host:port: {user, password}}
     cur_repo_viewer: null,
     encryp_key: null,
     repo_cache_dir: "",
@@ -112,7 +112,15 @@ function CreateMenu(){
             {
                 label:'set password',
                 icon: MenuIcon('key'),
-                click: () => { CallWeb('open-password-panel', { user: g_sys_params.user, hasPwd: !MyCheck.IsEmpty(g_sys_params.password) }) }
+                click: () => {
+                    var host = '';
+                    var cred = null;
+                    if (g_sys_params.cur_repo_viewer && g_sys_params.cur_repo_viewer.repo_url) {
+                        host = RepoUrl.GetHostPort(g_sys_params.cur_repo_viewer.repo_url);
+                        cred = host ? (g_sys_params.credentials[host] || null) : null;
+                    }
+                    CallWeb('open-password-panel', { host: host, user: cred ? cred.user : '', hasPwd: !!(cred && !MyCheck.IsEmpty(cred.password)) })
+                },
             },
             {
                 label: 'view action logs',
@@ -153,45 +161,124 @@ function CreateMenu(){
     ])
 }
 
+// 查找数据库中第一个 svn 仓库对应的主机:端口，供旧全局凭据迁移使用
+async function _FindFirstSvnHost() {
+    var repos = await viewer_db.GetRepoList();
+    for (var r of repos) {
+        if (RepoUrl.GetRepoType(r.repo) === 'svn') {
+            var host = RepoUrl.GetHostPort(r.repo);
+            if (host) return host;
+        }
+    }
+    return null;
+}
+
+// 按主机绑定的凭据在 sys.conf 中以 [cred@<host:port>] 节点存储
+const CRED_NODE_PREFIX = 'cred@';
+
+// 从 conf 读取全部按主机绑定的凭据（密文），返回 {host: {user, password, encrypt_type}}
+function _getAllCredFromConf() {
+    var root = g_conf.GetRoot();
+    var out = {};
+    for (var node in root) {
+        if (node && node.indexOf(CRED_NODE_PREFIX) === 0) {
+            var host = node.substring(CRED_NODE_PREFIX.length);
+            var c = root[node];
+            if (c) {
+                out[host] = {
+                    user: c.user || '',
+                    password: c.password || '',
+                    encrypt_type: c.encrypt_type || '',
+                };
+            }
+        }
+    }
+    return out;
+}
+
+// 将凭据（密文）写入 conf 的对应主机节点
+function _setCredToConf(host, user, password, encrypt_type) {
+    var node = CRED_NODE_PREFIX + host;
+    g_conf.Set('user', user, node);
+    g_conf.Set('password', password, node);
+    g_conf.Set('encrypt_type', encrypt_type, node);
+}
+
 async function Init(){
     MyLog.Init(path.join(g_sys_params.local_data_dir, 'logs', 'app'));
 
     g_conf = new MyConf(path.join(g_sys_params.local_data_dir, g_sys_params.config_file_name));
     g_sys_params.db_file = path.join(g_sys_params.local_data_dir, g_sys_params.db_file_name);
-    g_sys_params.user = g_conf.Get('user');
 
-    // 只在需要解密已有密码时生成硬件指纹密钥
-    var encryptType = g_conf.Get('encrypt_type');
-    if (encryptType === 'hw_fingerprint') {
+    // 旧版全局凭据（存于 sys.conf），仅用于一次性迁移到按主机绑定
+    var legacyUser = g_conf.Get('user');
+    var legacyPassword = g_conf.Get('password');
+    var legacyEncryptType = g_conf.Get('encrypt_type');
+
+    // 若旧全局凭据使用硬件指纹，需要在迁移/解密前生成密钥
+    if (legacyEncryptType === 'hw_fingerprint') {
         g_sys_params.encryp_key = await PasswordEncrypt.genEncrypKey();
-        MyLog.Info('[PasswordEncrypt] hw key generated for decrypting existing password');
+        MyLog.Info('[PasswordEncrypt] hw key generated for legacy credential migration');
     }
 
-    // 解密密码
-    g_sys_params.password = g_conf.Get('password');
-    if (g_sys_params.password) {
-        try {
-            var decrypted = PasswordEncrypt.decrypt(g_sys_params.password, encryptType, g_sys_params.encryp_key);
-            if (decrypted !== null) {
-                g_sys_params.password = decrypted;
-            } else {
-                // decrypt 返回 null 表示对应解密方式不可用
-                if (encryptType === 'safe_storage') {
-                    MyLog.Warn('Password encrypted with safeStorage but it is not available');
-                } else if (encryptType === 'hw_fingerprint') {
-                    MyLog.Error('Password encrypted with hardware fingerprint but encryp_key is not available');
+    // 初始化数据库
+    await viewer_db.Init(g_sys_params.db_file);
+
+    // 读取当前已按主机绑定的凭据（存于 conf）
+    var credentialStore = _getAllCredFromConf();
+
+    // 迁移旧全局凭据到数据库第一个 svn 仓库对应的主机
+    if (legacyUser && Object.keys(credentialStore).length === 0) {
+        var targetHost = await _FindFirstSvnHost();
+        if (targetHost) {
+            _setCredToConf(targetHost, legacyUser, legacyPassword || '', legacyEncryptType || '');
+            MyLog.Info(`legacy global credential migrated to host: ${targetHost}`);
+            credentialStore = _getAllCredFromConf();
+        } else {
+            MyLog.Warn('no svn repo found, legacy global credential dropped (not migrated)');
+        }
+    }
+    // 只要检测到旧全局凭据，就彻底删除，避免残留和重复迁移（即使已有新凭据或迁移失败）
+    if (legacyUser) {
+        g_conf.Delete('user');
+        g_conf.Delete('password');
+        g_conf.Delete('encrypt_type');
+        MyLog.Info('legacy global credential (user/password) removed from sys.conf');
+    }
+
+    // 解密并加载全部按主机绑定的凭据到内存
+    g_sys_params.credentials = {};
+    if (credentialStore) {
+        // 若存在按主机保存的硬件指纹凭据且尚未生成密钥，需先生成以便解密
+        if (!g_sys_params.encryp_key) {
+            for (var hfp in credentialStore) {
+                var hfpCred = credentialStore[hfp];
+                if (hfpCred && hfpCred.encrypt_type === 'hw_fingerprint') {
+                    g_sys_params.encryp_key = await PasswordEncrypt.genEncrypKey();
+                    MyLog.Info('[PasswordEncrypt] hw key generated for stored hw_fingerprint credentials');
+                    break;
                 }
-                g_sys_params.password = '';
             }
-        } catch (e) {
-            MyLog.Warn('Password decryption failed: ' + e.message);
-            g_sys_params.password = '';
+        }
+        for (var host in credentialStore) {
+            var c = credentialStore[host];
+            if (!c) continue;
+            var pwd = c.password || '';
+            if (pwd && (c.encrypt_type === 'safe_storage' || c.encrypt_type === 'hw_fingerprint')) {
+                try {
+                    var dec = PasswordEncrypt.decrypt(pwd, c.encrypt_type, g_sys_params.encryp_key);
+                    pwd = (dec !== null) ? dec : '';
+                } catch (e) {
+                    MyLog.Warn(`credential decrypt failed for ${host}: ${e.message}`);
+                    pwd = '';
+                }
+            }
+            g_sys_params.credentials[host] = { user: c.user || '', password: pwd };
         }
     }
 
     g_sys_params.repo_cache_dir = g_conf.GetOrSet('repo_cache_dir', path.join(g_sys_params.local_data_dir, 'repo_cache'));
     MyFile.MkDir(g_sys_params.repo_cache_dir);
-    viewer_db.Init(g_sys_params.db_file);
 
     g_sys_params.tmp_dir = path.join(g_sys_params.local_data_dir, 'tmp');
     MyFile.RmDir(g_sys_params.tmp_dir);
@@ -262,10 +349,10 @@ app.whenReady().then(() => {
 
     // 处理未捕获异常
     process.on('uncaughtException', function (error) {
-        SendErrorToWeb(error.message)
+        SendErrorToWeb(error)
     })
     process.on('unhandledRejection', (reason, promise) => {
-        SendErrorToWeb(reason.message)
+        SendErrorToWeb(reason)
     });
 
     // 监听渲染器到后台事件
@@ -302,9 +389,15 @@ function SendToWeb(name, data){
     }
 }
 // 后台异常通知前台，会弹框提示
+function ErrorMsg(err){
+    if (typeof err === 'string') return err;
+    if (err == null) return '未知错误';
+    return err.message || err.stack || JSON.stringify(err) || '未知错误';
+}
 function SendErrorToWeb(err_msg){
-    console.log(MyDate.Now() + " send error msg to web: " + err_msg)
-    SendToWeb('error-on-bg', err_msg)
+    const msg = ErrorMsg(err_msg);
+    console.log(MyDate.Now() + " send error msg to web: " + msg)
+    SendToWeb('error-on-bg', msg)
 }
 // 发送普通消息给前台，只在界面下方展示
 function SendInfoToWeb(msg){
@@ -343,38 +436,39 @@ async function SetLastRepo(repo_root){
  */
 async function RefreshRepoTree(repo_url=null, init_flag=false, force=false){
     let first_access = false;
-    if(!MyCheck.IsEmpty(g_sys_params.user)){
-        if(!g_sys_params.cur_repo_viewer || init_flag){
-            // 首次访问时设置仓库查看器
-            if(!repo_url){
-                var viewer_repo_url = g_conf.Get('last_repo')
-            }else{
-                var viewer_repo_url = repo_url;
-            }
-            first_access = true;
-            g_sys_params.cur_repo_viewer = new RepoViewer(viewer_repo_url, g_sys_params.user, 
-                g_sys_params.password, os_type, g_sys_params.repo_cache_dir);
-        }
-        // 如果repo_url包含版本号，需要去除，只有@符号后面没有/时才是版本号分隔符
-        if (repo_url && repo_url.indexOf('@') > 0 && repo_url.indexOf('/', repo_url.indexOf('@')) === -1) {
-            // 如果包含版本需要去除，版本号已经初始化在了api对象中，无需此处传入
-            repo_url = repo_url.substring(0, repo_url.indexOf('@'));
-        }
-        let repo_tree = await g_sys_params.cur_repo_viewer.Api().GetRepoTree(repo_url, force);
-        CallWeb('show-repo-tree', {url: repo_tree.url, tree: repo_tree});
-        
-        // 更新窗口标题，显示当前仓库信息
-        let repo_root = g_sys_params.cur_repo_viewer.Api().GetRepoRoot(repo_tree.url);
-        
-        // 如果需要记录最后访问的仓库，则将其保存到后台
-        if(init_flag && repo_url){
-            // 更换仓库时，需要更新最后访问的仓库地址
-            SetLastRepo(repo_root);
-        }else if(first_access){
-            UpdateWindowTitle(repo_root);
-        }
-        ShowCacheStatus();
+    var viewer_repo_url = repo_url || g_conf.Get('last_repo');
+    var host = RepoUrl.GetHostPort(viewer_repo_url);
+    var cred = host ? (g_sys_params.credentials[host] || null) : null;
+    if (!cred) {
+        // 该主机尚未配置凭据：弹出登录框；若留空（用户/密码都为空），保存后按匿名访问
+        CallWeb('open-password-panel', { host: host || '', user: '', hasPwd: false });
+        return;
     }
+    if(!g_sys_params.cur_repo_viewer || init_flag){
+        // 首次访问时设置仓库查看器
+        first_access = true;
+        g_sys_params.cur_repo_viewer = new RepoViewer(viewer_repo_url, cred.user,
+            cred.password, os_type, g_sys_params.repo_cache_dir);
+    }
+    // 如果repo_url包含版本号，需要去除，只有@符号后面没有/时才是版本号分隔符
+    if (repo_url && repo_url.indexOf('@') > 0 && repo_url.indexOf('/', repo_url.indexOf('@')) === -1) {
+        // 如果包含版本需要去除，版本号已经初始化在了api对象中，无需此处传入
+        repo_url = repo_url.substring(0, repo_url.indexOf('@'));
+    }
+    let repo_tree = await g_sys_params.cur_repo_viewer.Api().GetRepoTree(repo_url, force);
+    CallWeb('show-repo-tree', {url: repo_tree.url, tree: repo_tree});
+    
+    // 更新窗口标题，显示当前仓库信息
+    let repo_root = g_sys_params.cur_repo_viewer.Api().GetRepoRoot(repo_tree.url);
+    
+    // 如果需要记录最后访问的仓库，则将其保存到后台
+    if(init_flag && repo_url){
+        // 更换仓库时，需要更新最后访问的仓库地址
+        SetLastRepo(repo_root);
+    }else if(first_access){
+        UpdateWindowTitle(repo_root);
+    }
+    ShowCacheStatus();
 }
 
 function ShowCacheStatus(){
@@ -403,13 +497,20 @@ function HandleWebMsg(event, msg){
                 app.quit();
             },
             "set-password":async function(v){
-                g_conf.Set('user', v.user)
-                g_sys_params.user = v.user
+                var host = v.host;
+                if (!host) {
+                    SendInfoToWeb("please input host for credential");
+                    return;
+                }
+                // 从 conf 读取该主机已有凭据（密文）
+                var credStore = _getAllCredFromConf();
+                var current = credStore[host] || {};
+                current.user = v.user;
                 if(v.password !== undefined){
                     if (v.password === '') {
                         // 空密码：清空存储，encrypt_type 也清除
-                        g_conf.Set('password', '');
-                        g_conf.Set('encrypt_type', '');
+                        current.password = '';
+                        current.encrypt_type = '';
                     } else {
                         // 如果 safeStorage 不可用且尚无硬件密钥，现场生成
                         if (!PasswordEncrypt.isSafeStorageAvailable() && !g_sys_params.encryp_key) {
@@ -417,12 +518,27 @@ function HandleWebMsg(event, msg){
                             g_sys_params.encryp_key = await PasswordEncrypt.genEncrypKey();
                         }
                         var result = PasswordEncrypt.encrypt(v.password, g_sys_params.encryp_key);
-                        g_conf.Set('password', result.encrypted);
-                        g_conf.Set('encrypt_type', result.encryptType);
+                        current.password = result.encrypted;
+                        current.encrypt_type = result.encryptType;
                     }
-                    g_sys_params.password = v.password
                 }
-                SendInfoToWeb("save password ok");
+                _setCredToConf(host, current.user, current.password, current.encrypt_type);
+                // 更新内存态（明文），供当前会话使用
+                var pwdMem = g_sys_params.credentials[host] ? g_sys_params.credentials[host].password : '';
+                if (v.password === undefined) {
+                    // 未修改密码，保留原有明文
+                } else if (v.password === '') {
+                    pwdMem = '';
+                } else {
+                    pwdMem = v.password;
+                }
+                g_sys_params.credentials[host] = { user: v.user, password: pwdMem };
+                SendInfoToWeb("save password ok (" + host + ")");
+                // 保存成功后，若待访问的正是该主机的仓库，则自动重新加载目录树
+                var lastRepo = g_conf.Get('last_repo');
+                if (lastRepo && RepoUrl.GetHostPort(lastRepo) === host) {
+                    RefreshRepoTree();
+                }
             },
             "set-settings":function(v){
                 // 保存设置
@@ -472,19 +588,11 @@ function HandleWebMsg(event, msg){
                 })
             },
             "get-last-repo-tree":function(v){
-                // 检查是否设置了密码，如果没有，提示设置密码
-                if(!g_sys_params.user){
-                    CallWeb('open-password-panel')
-                    return
-                }
+                // 凭据缺失时 RefreshRepoTree 内部会弹登录框
                 RefreshRepoTree();
             },
             "get-repo-tree":function(v){
-                // 初始化仓库数据
-                if(!g_sys_params.user){
-                    CallWeb('open-password-panel')
-                    return
-                }
+                // 初始化仓库数据，凭据缺失时 RefreshRepoTree 内部会弹登录框
                 RefreshRepoTree(v, true);
             },
             "get-repo-node":function(v){
@@ -530,7 +638,7 @@ function HandleWebMsg(event, msg){
                 })
             },
             'get-repo-file-diff':function(v){
-                g_sys_params.cur_repo_viewer.Api().GetRepoFileDiff(v.path, v.begin, v.end).then((data) => {
+                g_sys_params.cur_repo_viewer.Api().GetRepoFileDiff(v.path, v.begin, v.end, v.copy_src).then((data) => {
                     CallWeb('show-repo-file-diff', data)
                     ShowCacheStatus();
                 })
@@ -539,6 +647,34 @@ function HandleWebMsg(event, msg){
                 g_sys_params.cur_repo_viewer.Api().GetRepoPropertyDiff(v.path, v.begin, v.end).then((data) => {
                     CallWeb('show-repo-properties-diff', data)
                 })
+            },
+            // ==================== 分支比对 ====================
+            'get-branch-list':async function(v){
+                var api = g_sys_params.cur_repo_viewer.Api();
+                try{
+                    var data = await api.GetBranchList(v);
+                    CallWeb('show-branch-list', data);
+                }catch(e){
+                    SendErrorToWeb('获取分支列表失败: ' + (e?.message || String(e)));
+                }
+            },
+            'compare-branch':async function(v){
+                var api = g_sys_params.cur_repo_viewer.Api();
+                try{
+                    var data = await api.CompareBranches(v.baseRoot, v.targetUrl, v.mode || 'base');
+                    CallWeb('show-branch-compare', data);
+                }catch(e){
+                    SendErrorToWeb('分支比对失败: ' + (e?.message || String(e)));
+                }
+            },
+            'compare-branch-file':async function(v){
+                var api = g_sys_params.cur_repo_viewer.Api();
+                try{
+                    var data = await api.GetBranchFileDiff(v.baseUrl, v.targetUrl);
+                    CallWeb('show-branch-file-diff', data);
+                }catch(e){
+                    SendErrorToWeb('查看文件差异失败: ' + (e?.message || String(e)));
+                }
             },
             'refresh-repo':function(v){
                 g_sys_params.cur_repo_viewer.Api().RefreshRepoTree(v);
@@ -626,7 +762,7 @@ function HandleWebMsg(event, msg){
         }
         ProcessWebCall[msg.type](value);
     } catch (error) {
-        SendErrorToWeb(error.message)
+        SendErrorToWeb(error)
     }
 }
 
@@ -684,8 +820,8 @@ async function RunDailyUpdate() {
 
     _UpdateHeartbeat();
 
-    if (!g_sys_params.user) {
-        MyLog.Info('Daily update skipped: no user/password configured');
+    if (!g_sys_params.credentials || Object.keys(g_sys_params.credentials).length === 0) {
+        MyLog.Info('Daily update skipped: no credentials configured');
         return;
     }
 
@@ -714,13 +850,21 @@ async function RunDailyUpdate() {
         let failCount = 0;
 
         for (const repo_url of repos) {
+            const host = RepoUrl.GetHostPort(repo_url);
+            const cred = host ? (g_sys_params.credentials[host] || null) : null;
+            if (!cred) {
+                const skipMsg = `[${taskId}] Skip repo (no credential for ${host}): ${repo_url}`;
+                MyLog.Info(skipMsg);
+                MyActionLog.Add(skipMsg, 'info');
+                continue;
+            }
             try {
                 const repoStartTime = Date.now();
                 const repoStartStr = MyDate.GetTime4Str(new Date(repoStartTime));
                 MyLog.Info(`[${taskId}] Updating repo: ${repo_url}`);
                 SendInfoToWeb(`[${repoStartStr}] Updating repo: ${repo_url}`);
 
-                const viewer = new RepoViewer(repo_url, g_sys_params.user, g_sys_params.password, os_type, g_sys_params.repo_cache_dir);
+                const viewer = new RepoViewer(repo_url, cred.user, cred.password, os_type, g_sys_params.repo_cache_dir);
                 await viewer.Api().GetRepoTree(repo_url, true); // force=true 强制刷新缓存
 
                 const repoElapsed = Date.now() - repoStartTime;

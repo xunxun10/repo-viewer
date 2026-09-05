@@ -90,6 +90,16 @@ if(typeof window.electronAPI != 'undefined'){
             "show-repo-properties-diff":function(v){
                 ShowDiff(v.pre, v.new, v.title);
             },
+            // ==================== 分支比对 ====================
+            "show-branch-list":function(v){
+                ShowBranchCompareDialog(v);
+            },
+            "show-branch-compare":function(v){
+                RenderBranchCompareList(v);
+            },
+            "show-branch-file-diff":function(v){
+                ShowBranchFileDiff(v);
+            },
             "show-action-logs":function(v){
                 ShowActionLogs(v);
             },

@@ -24,10 +24,16 @@ function _elapsed() {
     Info "耗时: ${elapsed}s"
 }
 
+function run(){
+    Info "启动 Electron 开发模式..."
+    cd "$S_DIR" && npm start
+}
+
 function show_help() {
     echo "Usage: ./dev.sh <command> [options]"
     echo ""
     echo "Commands:"
+    echo "  run       启动 Electron 开发模式（npm start）"
     echo "  new       小版本 +1（如 0.5.2 -> 0.5.3），末位递增"
     echo "  new major 大版本 +1（如 0.5.2 -> 0.6.0），中间位递增、末位归零"
     echo "  chg       将 change_log.txt 修改时间之后的 git 提交记录追加到最新变更"
@@ -121,18 +127,16 @@ function pack(){
         npm run arm;
         CheckOption "npm run arm 执行失败";
 
-        # linux同时打出增量包
-        incr;
-
-        cd $S_DIR/dist;
-
         Info "开始将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip ...";
-        rm -rf *.AppImage *.tar.gz *.zip repo-viewer-linux-arm64;
+        cd $S_DIR/dist && rm -rf *.AppImage *.tar.gz *.zip *.z01 *.z02 *.z03 repo-viewer-linux-arm64;
         mv linux-arm64-unpacked repo-viewer-linux-arm64 && 
             zip -r -s 40m repo-viewer-linux-arm64-$version.zip repo-viewer-linux-arm64 &&
             mv repo-viewer-linux-arm64 linux-arm64-unpacked &&
             Info "已经成功将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip 及分片文件";
         CheckOption "打包失败";
+
+        # linux同时打出增量包
+        incr;
     fi
 
     _elapsed $t_start "pack"
@@ -145,6 +149,7 @@ function incr(){
     local label_flag=$1
     local version=$(grep 'version' $S_DIR/package.json | awk -F '"' '{print $4}')
 
+    cd $S_DIR;
     if [ -n "$label_flag" ]; then
          find ./$dist_dir/ -type f | xargs md5sum | sort > "$label_file"
          Info "已生成标签文件: $label_file";
@@ -307,6 +312,9 @@ function chg(){
 }
 
 case "$1" in
+    run)
+        run
+        ;;
     new)
         incr_version "$2"
         ;;

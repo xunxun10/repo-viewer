@@ -48,6 +48,8 @@ class SvnCommandApi{
         this.os_type = os_type;
         this.cache_root_dir = cache_root_dir;  // 仅保存，不 InitCache
         this._cacheMap = {};   // projectRoot → { cacheDir, hash }
+        this._branchDiffCache = {};   // `${base}|${target}` → { time, data }，短期缓存分支比对摘要，避免切换目标分支时重复远程全树diff
+        this._forkRevCache = {};   // baseBranchUrl → 拉分支时版本（copy版本），分支创建后固定，跨会话缓存
 
         MyLog.Info(`svn command api init, repo: ${repo_url}, fixed_version: ${this.svn_version}, os type:${this.os_type}`);
     }
@@ -151,22 +153,16 @@ class SvnCommandApi{
         if (!searchUrl) return this._GetBranchRootUrl();
         const rootUrl = this.GetRepoRoot(searchUrl);
         const remaining = searchUrl.substring(rootUrl.length);
+        const parts = remaining.replace(/^\//, '').split('/');
 
-        const trunkIdx = remaining.indexOf('/trunk');
-        if (trunkIdx !== -1) {
-            return rootUrl + remaining.substring(0, trunkIdx + '/trunk'.length);
+        if (parts.length >= 1) {
+            if (parts[0] === 'trunk') {
+                return rootUrl + '/trunk';
+            }
+            if ((parts[0] === 'branches' || parts[0] === 'tags') && parts.length >= 2) {
+                return rootUrl + '/' + parts[0] + '/' + parts[1];
+            }
         }
-
-        const brMatch = remaining.match(/\/branches\/[^/]+/);
-        if (brMatch) {
-            return rootUrl + remaining.substring(0, brMatch.index + brMatch[0].length);
-        }
-
-        const tagMatch = remaining.match(/\/tags\/[^/]+/);
-        if (tagMatch) {
-            return rootUrl + remaining.substring(0, tagMatch.index + tagMatch[0].length);
-        }
-
         return this._GetBranchRootUrl();
     }
 
@@ -387,23 +383,14 @@ class SvnCommandApi{
      * @returns {string} 项目根 URL
      */
     GetRepoRoot(repo_url){
-        // 找到第一个trunk等目录位置，返回上级目录
-        var idx = repo_url.indexOf('/trunk');
-        if(idx !== -1){
-            return repo_url.substring(0, idx);
-        }else{
-            idx = repo_url.indexOf('/branches');
-            if(idx!== -1){
-                return repo_url.substring(0, idx);
-            }else{
-                idx = repo_url.indexOf('/tags');
-                if(idx!== -1){
-                    return repo_url.substring(0, idx);
-                }else{
-                    return repo_url;
-                }
+        // 找到第一个 trunk/branches/tags 目录位置（须为完整路径段，避免误匹配分支名如 trunk-buildconf-noapr），返回上级目录
+        const parts = repo_url.split('/');
+        for(let i = 1; i < parts.length; i++){
+            if(parts[i] === 'trunk' || parts[i] === 'branches' || parts[i] === 'tags'){
+                return parts.slice(0, i).join('/');
             }
         }
+        return repo_url;
     }
 
     async _GetSvnCommandResult(cmd_params){
@@ -555,9 +542,14 @@ class SvnCommandApi{
         if(!this.server_root){
             // 服务器根目录为url中/svn/之前的部分
             let idx = repo_url.indexOf('/svn/');
-            this.server_root = repo_url.substring(0, idx);
-            this.repo_root = this.server_root + "/svn/" + res_obj.base;  // 仓库根（Repo Root）
-
+            if(idx === -1){
+                // 非 /svn/ 布局的仓库（如 Apache: https://svn.apache.org/repos/asf/httpd/...），
+                // 用 svn info 获取权威的 repository root，避免硬编码 /svn/ 解析出错导致 diff URL 错误
+                await this._InitRepoRootFromInfo(repo_url, res_obj);
+            }else{
+                this.server_root = repo_url.substring(0, idx);
+                this.repo_root = this.server_root + "/svn/" + res_obj.base;  // 仓库根（Repo Root）
+            }
             MyLog.Info(`repo info init, repo url: ${repo_url}, server root: ${this.server_root}, repo_root: ${this.repo_root}`);  // TODO debug
         }
 
@@ -573,6 +565,42 @@ class SvnCommandApi{
      */
     async RefreshRepoTree(repo_url){
         return;
+    }
+
+    /**
+     * 对非 /svn/ 布局的仓库，通过 svn info 获取权威的 repository root 并初始化 server_root / repo_root
+     * @param {*} repo_url 
+     * @param {*} res_obj 刚解析得到的基础数据结构，会同步更新其中的 base / path
+     */
+    async _InitRepoRootFromInfo(repo_url, res_obj){
+        let info_res, info_json;
+        try{
+            info_res = await this._GetSvnCommandResult(`info "${repo_url}" --xml`);
+            info_json = SvnCommandApi._ParseXmlToJson(info_res);
+        }catch(e){
+            MyLog.Error(`svn info failed for ${repo_url}: ${e.message}`);
+            return;
+        }
+        let entry = info_json.info && info_json.info.entry;
+        if(!entry){
+            return;
+        }
+        let repos_root = entry.repository && entry.repository.root;
+        let cur_url = entry.url || repo_url;
+        if(!repos_root){
+            return;
+        }
+        repos_root = String(repos_root).replace(/\/+$/, '');
+        // repository root 即仓库根（Repo Root）
+        this.repo_root = repos_root;
+        // server_root 为 repository root 中携带协议/主机部分
+        var scheme_match = repos_root.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\/]+)/);
+        this.server_root = scheme_match ? scheme_match[1] : '';
+        // 与 /svn/ 分支一致：base 取仓库根最后一段，path 为仓库根之后的完整剩余路径
+        var after = cur_url.substring(repos_root.length).split('@')[0].replace(/^\/+/, '');
+        var segs = after.split('/');
+        res_obj.base = repos_root.split('/').pop() || '';
+        res_obj.path = '/' + (after || '');
     }
 
     async GetRepoFileContent(file_url, version=null){
@@ -631,18 +659,17 @@ class SvnCommandApi{
             ver_str = `-r ${end_rev}:${start_rev}`;
         }else if(!start_rev && end_rev){
             end_rev = parseInt(end_rev) - 1;
-            start_rev = end_rev - 1 - limit_num;
-            if(start_rev < 0){
-                start_rev = 0;
-            }
-            if (start_rev == 0 && end_rev == 0){
+            if (end_rev <= 0){
                 return [];
             }
-            ver_str = `-r ${end_rev}:${start_rev}`;
+            // More 分页：从上次最后一条 revision 往前数 limit_num 条触及该路径的记录。
+            // 用 --limit 而非固定 revision 区间，避免全局 revision 稀疏时区间内恰好无触及提交而返回空。
+            ver_str = `-r ${end_rev}:1`;
+            limit_str = `--limit ${limit_num}`;
         }else{
             limit_str = `--limit ${limit_num}`;
         }
-        let cmd_params = `log "${repo_url}" ${ver_str} ${limit_str} --stop-on-copy --xml -v`;
+        let cmd_params = `log "${repo_url}" ${ver_str} ${limit_str} --xml -v`;
         let res = await this._GetSvnCommandResult(cmd_params).catch(SvnCommandApi._ProcessCommandError);
         // console.log(res);  // debug console
 
@@ -690,7 +717,7 @@ class SvnCommandApi{
                     if(path.hasOwnProperty('@copyfrom-path')){
                         copy_from = path["@copyfrom-path"] + "@" + path["@copyfrom-rev"]
                     }
-                    let path_node = {action: path["@action"], path: path["#text"], kind: path['@kind'], text_mods:path['@text-mods'], prop_mods: path['@prop-mods'], copy_from:copy_from}
+                    let path_node = {action: path["@action"], path: path["#text"], kind: path['@kind'], text_mods:path['@text-mods'], prop_mods: path['@prop-mods'], copy_from:copy_from, revision: item['revision']}
                     item['files'].push(path_node);
                 }
             }
@@ -756,15 +783,16 @@ class SvnCommandApi{
      * @param {*} end  注意，需要获取的变更包含end版本的提交
      * @returns 
      */
-    async GetRepoFileDiff(file_url, begin, end){
+    async GetRepoFileDiff(file_url, begin, end, copy_src_url=null){
         var pre_content = '', new_content = '';
         if(begin !== null){
             begin = parseInt(begin);
-            pre_content = await this.GetRepoFileContent(file_url, begin - 1 );
+            // 跨 copy 时，旧版本内容从 copy 来源路径获取
+            pre_content = await this.GetRepoFileContent(copy_src_url ? copy_src_url : file_url, begin - 1 );
         }
         if(end !== null){
             end = parseInt(end);
-            var new_content = await this.GetRepoFileContent(file_url, end);
+            new_content = await this.GetRepoFileContent(file_url, end);
         }
         return {title:`${file_url} ${begin}:${end}`, pre: pre_content, new: new_content};
     }
@@ -789,6 +817,177 @@ class SvnCommandApi{
             new_prop = JSON.stringify(new_prop, null, 2).replace(/\\n/g, '\n');
         }
         return {title:`${file_url} ${begin}:${end}`, pre: pre_prop, new: new_prop};
+    }
+
+    /**
+     * 获取可进行分支比对的分支列表（含主线 trunk/main/master 及其余分支）
+     * @param {string} selUrl 当前选中的仓库路径
+     * @returns {Promise<{baseRoot, baseBranchName, defaultBranch, branches:[{name,url}]}>}
+     */
+    async GetBranchList(selUrl){
+        const baseRoot = this._ExtractBranchRootFromUrl(selUrl);
+        const projectRoot = this.GetRepoRoot(baseRoot);
+
+        // 1. 顶层目录：确定主线（trunk/main/master）及存在的 branches/tags 目录
+        let topNames = [];
+        try{
+            const topRes = await this._GetSvnCommandResult(`list "${projectRoot}" --xml`).catch(SvnCommandApi._ProcessCommandError);
+            topNames = SvnCommandApi._ParseRepoTree(topRes).dirs.map(d => d.text);
+        }catch(e){ topNames = []; }
+
+        // 2. 归类：非 branches/tags 的顶层目录视为"线"（如 trunk/main/master），优先 trunk/main/master
+        const lineNames = topNames.filter(n => n !== 'branches' && n !== 'tags');
+        let defaultName = null;
+        for(const p of ['trunk', 'main', 'master']){
+            if(lineNames.indexOf(p) !== -1){ defaultName = p; break; }
+        }
+        if(!defaultName && lineNames.length){ defaultName = lineNames[0]; }
+
+        const branches = [];
+        for(const n of lineNames){
+            branches.push({ name: n, url: `${projectRoot}/${n}` });
+        }
+
+        // 3. branches 目录下的子分支
+        if(topNames.indexOf('branches') !== -1){
+            try{
+                const brRes = await this._GetSvnCommandResult(`list "${projectRoot}/branches" --xml`).catch(SvnCommandApi._ProcessCommandError);
+                for(const bn of SvnCommandApi._ParseRepoTree(brRes).dirs.map(d => d.text)){
+                    branches.push({ name: bn, url: `${projectRoot}/branches/${bn}` });
+                }
+            }catch(e){ /* 分支目录不可读时忽略 */ }
+        }
+
+        // 4. 当前选中分支名（用于标题展示）
+        const baseParts = baseRoot.substring(projectRoot.length).replace(/^\/+/, '').split('/').filter(Boolean);
+        const baseBranchName = baseParts.length ? baseParts[baseParts.length - 1] : projectRoot;
+
+        // 5. 默认比对目标：主线 trunk/main/master
+        let defaultBranch = defaultName ? `${projectRoot}/${defaultName}` : (branches.length ? branches[0].url : '');
+
+        // 6. 若当前分支名含 _rf_，默认与去掉 _rf_ 及之后内容的分支比对；该分支不存在则退回主线
+        if(baseBranchName.indexOf('_rf_') !== -1){
+            const parentName = baseBranchName.split('_rf_')[0];
+            const found = branches.find(b => b.name === parentName);
+            if(found){ defaultBranch = found.url; }
+        }
+
+        return {
+            baseRoot,
+            baseBranchName,
+            defaultBranch,
+            branches
+        };
+    }
+
+    /**
+     * 比对两个分支树，返回变更文件列表
+     * @param {string} baseRoot 源分支根 URL
+     * @param {string} targetRoot 目标分支根 URL
+     * @returns {Promise<Array>} [{status, path, baseUrl, targetUrl}]
+     */
+    async CompareBranches(baseRoot, targetRoot, compareMode = 'base'){
+        // 目标分支(如trunk)作为"源"/基线，当前分支作为"新"
+        // compareMode: 'base'=与目标分支拉分支时的版本比对(默认); 'latest'=与目标分支最新版比对
+        const forkRev = compareMode === 'base' ? await this._ResolveForkRev(baseRoot) : null;
+        const oldRef = forkRev ? `${targetRoot}@${forkRev}` : targetRoot;
+
+        // 缓存键区分比对模式，避免 base/latest 互相串
+        const cacheKey = compareMode === 'base'
+            ? `${baseRoot}|${targetRoot}@${forkRev || 'HEAD'}`
+            : `${baseRoot}|${targetRoot}@HEAD`;
+        const hit = this._branchDiffCache[cacheKey];
+        const MAX_AGE = 60 * 1000;  // 60s内同一对(源,目标参考版本)复用摘要
+        if(hit && (Date.now() - hit.time) < MAX_AGE){ return hit.data; }
+
+        const res = await this._GetSvnCommandResult(`diff --summarize --old "${oldRef}" --new "${baseRoot}"`)
+            .catch(SvnCommandApi._ProcessCommandError);
+        const data = SvnCommandApi._ParseSummarizeDiff(res, targetRoot, baseRoot);
+        // base 模式下，旧/源侧内容固定到拉分支版本，文件级 diff 据此取目标分支拉分支时的内容
+        if(forkRev){
+            for(const it of data){
+                if(it.baseUrl){ it.baseUrl = `${it.baseUrl}@${forkRev}`; }
+            }
+        }
+        this._branchDiffCache[cacheKey] = { time: Date.now(), data };
+        return data;
+    }
+
+    /**
+     * 解析当前分支的拉分支版本：svn log --stop-on-copy 最旧一条日志的版本号即分支创建(拉分支)版本
+     */
+    async _ResolveForkRev(baseBranchUrl){
+        if(this._forkRevCache[baseBranchUrl]){ return this._forkRevCache[baseBranchUrl]; }
+        let rev = null;
+        try{
+            const out = await this._GetSvnCommandResult(`log --stop-on-copy -q "${baseBranchUrl}"`);
+            const lines = String(out || '').split(/\r?\n/);
+            for(let i = lines.length - 1; i >= 0; i--){
+                const m = lines[i].match(/^r(\d+)/);
+                if(m){ rev = m[1]; break; }
+            }
+        }catch(e){ rev = null; }
+        this._forkRevCache[baseBranchUrl] = rev;
+        return rev;
+    }
+
+    /**
+     * 解析 svn diff --summarize 输出为变更文件列表
+     * 注意：调用时已按「目标分支为源」交换传参，故本函数中 baseRoot 实为"旧/源"侧、targetRoot 实为"新"侧
+     * @param {string} text
+     * @param {string} baseRoot 旧/源侧分支根（传入的 targetRoot）
+     * @param {string} targetRoot 新侧分支根（传入的 baseRoot）
+     */
+    static _ParseSummarizeDiff(text, baseRoot, targetRoot){
+        const list = [];
+        const lines = String(text || '').split(/\r?\n/);
+        for(const ln of lines){
+            if(!ln.trim()) continue;
+            // 形如: "M       /repo/trunk/foo/bar.c"
+            const m = ln.match(/^(\S+)\s+(.+)$/);
+            if(!m) continue;
+            const status = m[1].trim()[0];
+            if(!['M', 'A', 'D'].includes(status)) continue;
+            const fullPath = m[2].trim();
+
+            let rel = null;
+            if(fullPath.startsWith(baseRoot)){ rel = fullPath.substring(baseRoot.length); }
+            else if(fullPath.startsWith(targetRoot)){ rel = fullPath.substring(targetRoot.length); }
+            else { rel = fullPath; }
+            rel = rel.replace(/^\/+/, '');
+
+            let baseUrl = null, targetUrl = null;
+            if(status === 'A'){
+                // A: 仅存在于"新"(当前分支)侧
+                targetUrl = `${targetRoot}/${rel}`;
+            }else if(status === 'D'){
+                // D: 仅存在于"旧/源"(目标分支/trunk)侧
+                baseUrl = `${baseRoot}/${rel}`;
+            }else{
+                // M: 两侧均存在
+                baseUrl = `${baseRoot}/${rel}`;
+                targetUrl = `${targetRoot}/${rel}`;
+            }
+            list.push({ status, path: rel, baseUrl, targetUrl });
+        }
+        return list;
+    }
+
+    /**
+     * 获取单个文件的跨分支差异内容（两侧均取 HEAD）
+     * @param {string} baseUrl 源分支文件 URL，可为 null（目标新增）
+     * @param {string} targetUrl 目标分支文件 URL，可为 null（源分支独有）
+     * @returns {Promise<{title, pre, new}>}
+     */
+    async GetBranchFileDiff(baseUrl, targetUrl){
+        let pre = '', new_content = '';
+        if(baseUrl){
+            try{ pre = await this.GetRepoFileContent(baseUrl); }catch(e){ pre = ''; }
+        }
+        if(targetUrl){
+            try{ new_content = await this.GetRepoFileContent(targetUrl); }catch(e){ new_content = ''; }
+        }
+        return { title: `${baseUrl || '(none)'} ↔ ${targetUrl || '(none)'}`, pre: pre, new: new_content };
     }
 
     // 其他工具函数

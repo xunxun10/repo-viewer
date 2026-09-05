@@ -59,6 +59,18 @@ class MyConf{
         }
         return this.Get(name, node)
     }
+
+    /**
+     * 彻底删除某个配置键并保存（不会残留空值行）
+     * @param {string} name 
+     * @param {string} node 
+     */
+    Delete(name, node='global'){
+        if(this.parsed_cfg[node] && name in this.parsed_cfg[node]){
+            delete this.parsed_cfg[node][name]
+            fs.writeFileSync(this.cfg_path, ini.stringify(this.parsed_cfg))
+        }
+    }
 }
 
 module.exports = MyConf;

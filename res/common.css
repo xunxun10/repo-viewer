@@ -148,8 +148,8 @@ body {
     box-shadow: var(--shadow-sm);
 }
 .repo-dir,.repo-file, .repo-file-head{
-    line-height: 22px;
-    font-size: 12px;
+    line-height: 24px;
+    font-size: 14px;
 }
 .title-div{
     padding: 2px 0px 2px 5px;
@@ -181,7 +181,7 @@ body {
     padding: 4px 0px 4px 5px;
     font-weight: 600;
     color: var(--color-text-secondary);
-    font-size: 12px;
+    font-size: 14px;
 }
 /* 文件列表行交替色 */
 #repo-file-list .repo-file:nth-child(odd) {
@@ -957,4 +957,67 @@ tr,th,td{
 }
 .all-repo-search-item:last-child {
     border-bottom: none;
+}
+
+/* 分支比对 */
+#bc-head {
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--color-border-light);
+}
+.bc-label {
+    font-weight: bold;
+    margin-right: 6px;
+}
+#bc-branch-select {
+    min-width: 220px;
+    padding: 2px 4px;
+}
+.bc-hint {
+    margin-left: 10px;
+    color: var(--color-text-muted);
+    font-size: 12px;
+}
+.bc-latest-label {
+    margin-left: 14px;
+    font-size: 12px;
+    color: var(--color-text);
+    cursor: pointer;
+    user-select: none;
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+}
+.bc-latest-label input {
+    margin: 0 4px 0 0;
+}
+#bc-file-container {
+    max-height: 400px;
+    overflow-y: auto;
+}
+#bc-file-list-head {
+    margin: 4px 0;
+    color: var(--color-text-muted);
+}
+.bc-file-item {
+    user-select: none;
+}
+.bc-file-item .log-file-path {
+    width: calc(100% - 10px - 20px - 20px - 40px);
+    padding-left: 6px;
+    cursor: pointer;
+}
+.bc-file-path {
+    display: inline-block;
+    width: calc(100% - 10px - 20px - 20px - 40px);
+    padding-left: 6px;
+    cursor: pointer;
+}
+.bc-file-item:hover {
+    cursor: pointer;
+    background-color: var(--color-hover);
+}
+.bc-empty {
+    padding: 12px;
+    color: var(--color-text-muted);
 }

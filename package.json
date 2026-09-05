@@ -1,6 +1,6 @@
 {
   "name": "repo-viewer",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "源码仓库浏览器",
   "main": "main.js",
   "scripts": {
