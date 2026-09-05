@@ -92,7 +92,7 @@ function _detect_platform() {
         dist_dir="dist/win-unpacked"
         zip_cmd="$S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip"
         label_file="dist.files.md5.win.txt"
-        platform_suffix="win"
+        platform_suffix="win32-x64"
     elif [ `uname -m` == "aarch64" ]; then
         dist_dir="dist/linux-arm64-unpacked"
         zip_cmd="zip -r"
@@ -107,6 +107,9 @@ function _detect_platform() {
 function pack(){
     local t_start=$(date +%s)
     local version=$(grep 'version' $S_DIR/package.json | awk -F '"' '{print $4}')
+    # 所有平台统一按最大 99MB 分片压缩
+    local split_size="99m"
+    local zip_split_num=99
 
     if [ `uname -m` == "x86_64" ]; then
         Info "开始执行 npm dist 打包命令 ...";
@@ -115,22 +118,22 @@ function pack(){
 
         cd $S_DIR/dist;
 
-        Info "开始将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip ...";
-        rm -rf repo-viewer-win32-x64*.tar.gz repo-viewer-win32-x64*.zip repo-viewer-win32-x64;
+        Info "开始将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip（按 ${split_size} 分片） ...";
+        rm -rf repo-viewer-win32-x64*.tar.gz repo-viewer-win32-x64*.zip repo-viewer-win32-x64*.z[0-9][0-9] repo-viewer-win32-x64;
         cp -rfa win-unpacked repo-viewer-win32-x64 && 
-            $S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip repo-viewer-win32-x64-$version.zip repo-viewer-win32-x64 &&
+            $S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip repo-viewer-win32-x64-$version.zip repo-viewer-win32-x64 -v${split_size} &&
             rm -rf repo-viewer-win32-x64 &&
-            Info "已经成功将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip";
+            Info "已经成功将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip（最大 ${split_size} 分片）";
         CheckOption "打包失败";
     elif [ `uname -m` == "aarch64" ]; then
         Info "开始执行 npm run arm 打包命令 ...";
         npm run arm;
         CheckOption "npm run arm 执行失败";
 
-        Info "开始将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip ...";
-        cd $S_DIR/dist && rm -rf *.AppImage *.tar.gz *.zip *.z01 *.z02 *.z03 repo-viewer-linux-arm64;
+        Info "开始将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip（按 ${split_size} 分片） ...";
+        cd $S_DIR/dist && rm -rf *.AppImage *.tar.gz *.zip *.z[0-9][0-9] repo-viewer-linux-arm64;
         mv linux-arm64-unpacked repo-viewer-linux-arm64 && 
-            zip -r -s 40m repo-viewer-linux-arm64-$version.zip repo-viewer-linux-arm64 &&
+            zip -r -s ${zip_split_num}m repo-viewer-linux-arm64-$version.zip repo-viewer-linux-arm64 &&
             mv repo-viewer-linux-arm64 linux-arm64-unpacked &&
             Info "已经成功将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip 及分片文件";
         CheckOption "打包失败";
@@ -172,7 +175,8 @@ function incr(){
 
     local incr_zip="dist/repo-viewer.$version.$platform_suffix.incr.zip"
 
-    rm -rf "$incr_dir" "$incr_zip"  && mkdir -p "$incr_dir"
+    # 清理所有历史增量包及解包目录（用通配符，兼容版本号/平台后缀变化导致的残留）
+    rm -rf "$incr_dir" dist/repo-viewer.*.incr.zip  && mkdir -p "$incr_dir"
     CheckOption "创建增量目录失败"
 
     for file in $diff_files; do
