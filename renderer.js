@@ -589,7 +589,7 @@ function ShowSavedRepoList(repo_list){
             short_url = short_url.replace(/\/$/, '').split('/').pop().slice(0, 3).toUpperCase();
             nickname = short_url;
         }
-        html += `<div class='saved-repo-item' id='saved-repo-${i}' title="${url} (Ctrl+click: open in new window)" url="${url}">${nickname}</div>`;
+        html += `<div class='saved-repo-item' id='saved-repo-${i}' title="${url}" url="${url}">${nickname}</div>`;
         repo_val_list.push(url);
     }
     html += `</div>`;

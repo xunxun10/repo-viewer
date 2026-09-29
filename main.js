@@ -72,7 +72,14 @@ function OpenRepoInNewProcess(repo_url){
     if (!repo_url) return;
     // 打包后execPath为应用exe直接传参即可；开发模式下execPath为electron，需附带应用路径
     const args = app.isPackaged ? ['--open-repo=' + repo_url] : [app.getAppPath(), '--open-repo=' + repo_url];
-    const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    // Linux的AppImage打包下execPath指向临时挂载目录(/tmp/.mount_xxx)内的二进制，
+    // 直接spawn依赖挂载存续不可靠，优先用APPIMAGE环境变量指向的AppImage文件启动
+    let exe = process.execPath;
+    if (app.isPackaged && process.env.APPIMAGE) {
+        exe = process.env.APPIMAGE;
+    }
+    // 注意不能加windowsHide:true，Windows的CREATE_NO_WINDOW标志会导致新实例窗口不显示
+    const child = spawn(exe, args, { detached: true, stdio: 'ignore' });
     child.unref();
     MyLog.Info('open repo in new process: ' + repo_url);
 }
