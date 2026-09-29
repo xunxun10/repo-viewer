@@ -54,6 +54,29 @@ var g_sys_params = {
 
 var viewer_db = new ViewerDb();
 
+// ==================== Ctrl点击新进程打开仓库 ====================
+// 解析启动参数传入的仓库地址 --open-repo=<url>，用于新进程启动时直接打开对应仓库
+function GetStartupRepoUrl(){
+    const prefix = '--open-repo=';
+    for (var i = 1; i < process.argv.length; i++) {
+        if (process.argv[i].indexOf(prefix) === 0) {
+            return process.argv[i].substring(prefix.length);
+        }
+    }
+    return null;
+}
+var g_startup_repo_url = GetStartupRepoUrl();
+
+// 以新进程打开指定仓库地址（独立于当前窗口）
+function OpenRepoInNewProcess(repo_url){
+    if (!repo_url) return;
+    // 打包后execPath为应用exe直接传参即可；开发模式下execPath为electron，需附带应用路径
+    const args = app.isPackaged ? ['--open-repo=' + repo_url] : [app.getAppPath(), '--open-repo=' + repo_url];
+    const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+    MyLog.Info('open repo in new process: ' + repo_url);
+}
+
 // 调度器锁相关
 const LOCK_HEARTBEAT_INTERVAL = 3600000;  // 心跳间隔一小时
 const LOCK_STALE_TIMEOUT = 7200000;      // 锁超时2小时
@@ -594,8 +617,19 @@ function HandleWebMsg(event, msg){
                 })
             },
             "get-last-repo-tree":function(v){
+                if (g_startup_repo_url) {
+                    // 启动参数携带仓库地址（Ctrl点击左侧列表新进程打开），直接打开对应仓库
+                    var startup_url = g_startup_repo_url;
+                    g_startup_repo_url = null;
+                    RefreshRepoTree(startup_url, true);
+                    return;
+                }
                 // 凭据缺失时 RefreshRepoTree 内部会弹登录框
                 RefreshRepoTree();
+            },
+            "open-repo-in-new-process":function(v){
+                // Ctrl点击左侧仓库列表，以新进程打开对应仓库地址
+                OpenRepoInNewProcess(v);
             },
             "get-repo-tree":function(v){
                 // 初始化仓库数据，凭据缺失时 RefreshRepoTree 内部会弹登录框

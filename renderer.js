@@ -589,7 +589,7 @@ function ShowSavedRepoList(repo_list){
             short_url = short_url.replace(/\/$/, '').split('/').pop().slice(0, 3).toUpperCase();
             nickname = short_url;
         }
-        html += `<div class='saved-repo-item' id='saved-repo-${i}' title="${url}" url="${url}">${nickname}</div>`;
+        html += `<div class='saved-repo-item' id='saved-repo-${i}' title="${url} (Ctrl+click: open in new window)" url="${url}">${nickname}</div>`;
         repo_val_list.push(url);
     }
     html += `</div>`;
@@ -602,9 +602,13 @@ function ShowSavedRepoList(repo_list){
             CallSys('get-recent-repos');
         }
     });
-    // 点击后设置repo_url并调用access-btn
-    $(".saved-repo-item").click(function(){
+    // 点击后设置repo_url并调用access-btn；Ctrl+点击时以新进程打开对应仓库
+    $(".saved-repo-item").click(function(e){
         var repo_url = $(this).attr('url');
+        if (e.ctrlKey) {
+            CallSys('open-repo-in-new-process', repo_url);
+            return;
+        }
         $('#repo-url').val(repo_url);
         $('#access-btn').click();
     });
