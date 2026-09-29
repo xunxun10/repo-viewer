@@ -179,6 +179,30 @@ function _ResolveCopySrc(path, begin, end){
     return {src: src, dst: dst};
 }
 
+/**
+ * 判断日志文件路径是否与选中路径相关：原路径直接命中，或经任一 copy 关系
+ * （把源路径前缀替换为 copy 目标路径，如 /trunk/a.c → /branches/foo/a.c）转换后命中。
+ * svn log -v 会列出每条提交的全部变更文件，其中很多与选中路径无关，需据此过滤。
+ * @param {string} p 日志中的文件路径（仓库根相对，含项目段）
+ * @param {string} cur_path 选中路径（同为仓库根相对）
+ * @param {object} copy_map _BuildCopyMap() 的结果
+ */
+function _IsLogPathRelated(p, cur_path, copy_map){
+    if(p === cur_path || p.indexOf(cur_path + '/') === 0){
+        return true;
+    }
+    for(var k in copy_map){
+        var src = copy_map[k].src;
+        if(p === src || p.indexOf(src + '/') === 0){
+            var conv = k + p.substring(src.length);
+            if(conv === cur_path || conv.indexOf(cur_path + '/') === 0){
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 function ShowLogFiles(indexs){
     var html = '';
     // 聚合所有files信息
@@ -197,6 +221,18 @@ function ShowLogFiles(indexs){
         files_key[str] = true;
         return !exists;
     });
+
+    // 按选中路径过滤文件列表：svn log -v 列出的是每条提交的全部变更文件（含与选中路径
+    // 无关的文件；pre-copy 提交的路径还位于源分支命名空间），pre-copy 路径经 copy 关系
+    // 转换回当前分支路径后再匹配，只保留与选中路径相关的文件（提交列表由 svn log 自身
+    // 按路径过滤，无需前端处理）。
+    var cur_path = _GetSelPath().replace(gv.gv_repo_head, '');
+    if(cur_path){
+        var copy_map = _BuildCopyMap();
+        files = files.filter(function(f){
+            return _IsLogPathRelated(f.path, cur_path, copy_map);
+        });
+    }
 
     // http://git.mine/svn 仓库在 copy 后会在不同分支保留来源文件，需一并列出并支持 diff
     for(var i = 0; i < files.length; i++){

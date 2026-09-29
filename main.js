@@ -155,6 +155,12 @@ function CreateMenu(){
                     icon: MenuIcon('doc'),
                     // 向前台发送消息
                     click: () => { AlertToWeb(MyFile.SyncRead(path.join(__dirname, 'LICENSE'))); },
+                },
+                {
+                    label: 'Change Log',
+                    icon: MenuIcon('doc'),
+                    // 向前台发送消息
+                    click: () => { AlertToWeb(MyFile.SyncRead(path.join(__dirname, 'change_log.txt'))); },
                 }
             ]
         },

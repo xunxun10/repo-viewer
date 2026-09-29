@@ -36,7 +36,7 @@ function show_help() {
     echo "  run       启动 Electron 开发模式（npm start）"
     echo "  new       小版本 +1（如 0.5.2 -> 0.5.3），末位递增"
     echo "  new major 大版本 +1（如 0.5.2 -> 0.6.0），中间位递增、末位归零"
-    echo "  chg       将 change_log.txt 修改时间之后的 git 提交记录追加到最新变更"
+    echo "  chg       将尚未记录的 git 提交追加到 change_log.txt（记录上次执行时间，人工调整后不会重复追加）"
     echo "  build     运行 npm run dist 构建"
     echo "  pack      构建并打包为完整安装包（含 tar.gz / zip）"
     echo "  incr      生成增量更新包（基于 dist.files.md5 对比）"
@@ -110,13 +110,13 @@ function _detect_platform() {
     case "$(_detect_arch)" in
         x64)
         dist_dir="dist/win-unpacked"
-        zip_cmd="$S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip -bso0 -bsp0"
+        ZA="$S_DIR/node_modules/7zip-bin/win/x64/7za.exe"
         label_file="dist.files.md5.win.txt"
         platform_suffix="win32-x64"
         ;;
         arm64)
         dist_dir="dist/linux-arm64-unpacked"
-        zip_cmd="zip -rq"
+        ZA="$S_DIR/node_modules/7zip-bin/linux/arm64/7za"
         label_file="dist.files.md5.txt"
         platform_suffix="linux-arm64"
         ;;
@@ -127,12 +127,40 @@ function _detect_platform() {
     esac
 }
 
+# 用 7za 按分片大小压缩并做单分卷兜底重命名。
+# $1=zip 名（不含扩展），$2=待压缩目录，$3=分片大小（如 99m）。成功返回 0，失败返回 1。
+function _zip_pack(){
+    local zname=$1
+    local srcdir=$2
+    local split_size=$3
+
+    "$ZA" a -tzip -bso0 -bsp0 "$zname.zip" "$srcdir" -v${split_size}
+    if [ $? -ne 0 ]; then
+        Error "压缩 $zname.zip 失败"
+        return 1
+    fi
+
+    # 兜底：仅一个分卷时重命名为普通 .zip
+    if [ -f "$zname.zip.001" ] && [ ! -f "$zname.zip.002" ]; then
+        mv "$zname.zip.001" "$zname.zip"
+        Info "仅一个分卷，已重命名为 $zname.zip"
+    fi
+    return 0
+}
+
 function pack(){
     local t_start=$(date +%s)
     local version=$(grep 'version' $S_DIR/package.json | awk -F '"' '{print $4}')
     # 所有平台统一按最大 99MB 分片压缩
     local split_size="99m"
-    local zip_split_num=99
+
+    _detect_platform
+
+    # 7za 由 electron-builder 依赖（7zip-bin）提供，所有平台统一使用，避免依赖系统 zip 命令
+    if [ ! -f "$ZA" ]; then
+        Error "未找到 7za（$ZA），请先执行 npm install"
+        exit 1
+    fi
 
     case "$(_detect_arch)" in
         x64)
@@ -143,9 +171,9 @@ function pack(){
         cd $S_DIR/dist;
 
         Info "开始将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip（按 ${split_size} 分片） ...";
-        rm -rf repo-viewer-win32-x64*.tar.gz repo-viewer-win32-x64*.zip repo-viewer-win32-x64*.z[0-9][0-9] repo-viewer-win32-x64;
-        cp -rfa win-unpacked repo-viewer-win32-x64 && 
-            $S_DIR/node_modules/7zip-bin/win/x64/7za.exe a -tzip -bso0 -bsp0 repo-viewer-win32-x64-$version.zip repo-viewer-win32-x64 -v${split_size} &&
+        rm -rf repo-viewer-win32-x64*.tar.gz repo-viewer-win32-x64*.zip repo-viewer-win32-x64*.zip.[0-9][0-9][0-9] repo-viewer-win32-x64*.z[0-9][0-9] repo-viewer-win32-x64;
+        cp -rfa win-unpacked repo-viewer-win32-x64 &&
+            _zip_pack repo-viewer-win32-x64-$version repo-viewer-win32-x64 "$split_size" &&
             rm -rf repo-viewer-win32-x64 &&
             Info "已经成功将 win-unpacked 打包为 repo-viewer-win32-x64-$version.zip（最大 ${split_size} 分片）";
         CheckOption "打包失败";
@@ -156,9 +184,9 @@ function pack(){
         CheckOption "npm run arm 执行失败";
 
         Info "开始将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip（按 ${split_size} 分片） ...";
-        cd $S_DIR/dist && rm -rf *.AppImage *.tar.gz *.zip *.z[0-9][0-9] repo-viewer-linux-arm64;
-        mv linux-arm64-unpacked repo-viewer-linux-arm64 && 
-            zip -rq -s ${zip_split_num}m repo-viewer-linux-arm64-$version.zip repo-viewer-linux-arm64 &&
+        cd $S_DIR/dist && rm -rf *.AppImage *.tar.gz *.zip *.zip.[0-9][0-9][0-9] *.z[0-9][0-9] repo-viewer-linux-arm64;
+        mv linux-arm64-unpacked repo-viewer-linux-arm64 &&
+            _zip_pack repo-viewer-linux-arm64-$version repo-viewer-linux-arm64 "$split_size" &&
             mv repo-viewer-linux-arm64 linux-arm64-unpacked &&
             Info "已经成功将 linux-arm64-unpacked 打包为 repo-viewer-linux-arm64-$version.zip 及分片文件";
         CheckOption "打包失败";
@@ -177,6 +205,12 @@ function pack(){
 
 function incr(){
     _detect_platform
+
+    # 7za 由 electron-builder 依赖（7zip-bin）提供，所有平台统一使用，避免依赖系统 zip 命令
+    if [ ! -f "$ZA" ]; then
+        Error "未找到 7za（$ZA），请先执行 npm install"
+        exit 1
+    fi
 
     local t_start=$(date +%s)
     local label_flag=$1
@@ -220,7 +254,7 @@ function incr(){
     done
 
     Info "压缩增量文件到 $incr_zip"
-    $zip_cmd "$incr_zip" $incr_dir/*;
+    "$ZA" a -tzip -bso0 -bsp0 "$incr_zip" $incr_dir/*;
     CheckOption "压缩 $incr_zip"
     _elapsed $t_start "incr"
 }
@@ -229,6 +263,7 @@ function clean(){
     _detect_platform
     Info "开始清理 $S_DIR/$dist_dir  $S_DIR/dist/incr"
     rm -rf $S_DIR/$dist_dir $S_DIR/dist/incr;
+    rm -rf $S_DIR/dist/repo-viewer-*.zip $S_DIR/dist/repo-viewer-*.zip.[0-9][0-9][0-9] $S_DIR/dist/repo-viewer-*.tar.gz;
 }
 
 function push(){
@@ -293,20 +328,30 @@ function push(){
 
 function chg(){
     local t_start=$(date +%s)
+    local t_stamp=$(date '+%Y-%m-%d %H:%M:%S')
     local changelog="$S_DIR/change_log.txt"
-    local git_dir="$S_DIR"
 
-    # 获取 change_log.txt 的最后修改时间（兼容 Linux/macOS）
-    local mtime
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        mtime=$(stat -f %m "$changelog")
-    else
-        mtime=$(stat -c %Y "$changelog")
+    # 检查上游分支（用于对比本地未推送的提交）
+    local upstream
+    upstream=$(cd "$S_DIR" && git rev-parse --abbrev-ref @{u} 2>/dev/null)
+    if [ -z "$upstream" ]; then
+        Error "没有上游分支，请先设置 upstream"
+        exit 1
     fi
+    Info "对比上游: $upstream"
 
-    # 获取该时间之后的 git 提交记录（排除 merge 提交）
+    # 上次执行 chg 的时间（记录在change_log.txt首行标记中，人工调整后旧记录不会被重复追加）
+    local last_time
+    last_time=$(head -1 "$changelog" | sed -n 's/^<!-- chg: \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\) -->$/\1/p')
+
+    # 获取范围内的提交记录（排除 merge 提交）：优先从上次执行时间开始；无记录时对比上游
     local new_entries
-    new_entries=$(cd "$git_dir" && git log --since="@$mtime" --format="- %s" --no-merges --reverse 2>/dev/null)
+    if [ -n "$last_time" ]; then
+        Info "从上次执行时间 $last_time 开始获取提交"
+        new_entries=$(cd "$S_DIR" && git log --format="- %s" --no-merges --reverse --since="$last_time")
+    else
+        new_entries=$(cd "$S_DIR" && git log --format="- %s" --no-merges --reverse "@{u}..HEAD")
+    fi
 
     if [ -z "$new_entries" ]; then
         Info "没有新的 git 提交记录"
@@ -316,6 +361,14 @@ function chg(){
 
     Info "发现新的提交记录："
     echo "$new_entries"
+
+    # 将本次执行时间更新到change_log.txt首行标记（这些提交已纳入处理范围，人工调整后不再重复展示）
+    if head -1 "$changelog" | grep -q '^<!-- chg: '; then
+        sed -i "1c <!-- chg: $t_stamp -->" "$changelog"
+    else
+        sed -i "1i <!-- chg: $t_stamp -->" "$changelog"
+    fi
+    Info "已记录本次执行时间: $t_stamp"
 
     # 过滤掉已存在于 change_log.txt 中的条目，再插入到最新变更后
     local filtered=""
@@ -336,8 +389,10 @@ function chg(){
     Info "新增不重复的条目："
     echo "$filtered"
 
-    # 追加到文件末尾
-    echo "" >> "$changelog"
+    # 追加到文件末尾：文件末尾无换行时补一个，避免新条目前出现多余空行
+    if [ -s "$changelog" ] && [ -n "$(tail -c 1 "$changelog")" ]; then
+        echo "" >> "$changelog"
+    fi
     echo "$filtered" >> "$changelog"
 
     local count=$(echo "$filtered" | wc -l)
