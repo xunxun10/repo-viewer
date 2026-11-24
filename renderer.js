@@ -15,11 +15,14 @@ gv = {
     gv_selected_log_version: null,  // 当前选中的提交日志版本起始号[begin, end]
     gv_local_cached:false,  // 是否本地缓存仓库数据
     show_files:[],  // 显示的文件列表
+    gv_refresh_node_pending:false,  // 是否正在执行树节点刷新（用于刷新完成后显示提示）
 }
 
 // 监听后台发来的事件
 if(typeof window.electronAPI != 'undefined'){
     window.electronAPI.OnBgErrorMsg((_event, value) => {
+        // 刷新失败时清除待提示状态，避免后续树更新误显示“刷新完成”
+        gv.gv_refresh_node_pending = false;
         MyModal.Alert("Error: " + value);
     })
     window.electronAPI.OnSysCall((_event, msg) => {
@@ -63,6 +66,11 @@ if(typeof window.electronAPI != 'undefined'){
             },
             "show-repo-tree":function(v){
                 UpdateView(v);
+                // 左侧树节点刷新完成
+                if(gv.gv_refresh_node_pending){
+                    gv.gv_refresh_node_pending = false;
+                    MyModal.Toast('刷新完成');
+                }
             },
             "save-repo-url-ok":function(v){
                 Info(`save repo url ok: ${v.nickname}:${v.repo_url}`);
@@ -82,7 +90,8 @@ if(typeof window.electronAPI != 'undefined'){
             },
             "show-refreshed-repo-log":function(v){
                 // 刷新期间用户可能已关闭日志弹框或切到了其它路径，此时忽略过期结果
-                if($("#log-item-container").length === 0 || !$("#my-info").hasClass('in')){
+                // （弹框内容在隐藏时会被移除，据此判断即可，不要判断淡入过程中的 in 类）
+                if($("#log-item-container").length === 0){
                     return;
                 }
                 if(v.path !== _GetSelPath()){
@@ -90,6 +99,12 @@ if(typeof window.electronAPI != 'undefined'){
                 }
                 ShowLogDialog(v.logs);
                 Info('commit log refreshed');
+            },
+            "show-commit-files":function(v){
+                OnCommitFilesLoaded(v);
+            },
+            "show-commit-files-failed":function(v){
+                OnCommitFilesFailed(v);
             },
             "refresh-repo-log-failed":function(){
                 $("#refresh-log-btn").prop('disabled', false).text('Refresh');
@@ -198,7 +213,9 @@ function UpdateView(repo){
     if(gv.gv_select_node){
         gv.gv_tree_cache[gv.gv_select_node.id] = repo;
     }else{
-        // 首次访问，设置根节点信息
+        // 首次访问或切换仓库，设置根节点信息
+        // 新建树后节点 id 会重新生成，清空旧缓存避免复用其它仓库的数据
+        gv.gv_tree_cache = {};
         gv.gv_tree_cache['#'] = repo;
         // 如果tree.local_cached有值，则设置为本地缓存状态
         gv.gv_local_cached = repo.tree.local_cached;

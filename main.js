@@ -693,6 +693,22 @@ function HandleWebMsg(event, msg){
                     CallWeb('refresh-repo-log-failed');
                 }
             },
+            "get-commit-files":async function(v){
+                // 按需获取指定提交涉及的文件列表（git 日志弹框点击提交时触发）
+                let api = g_sys_params.cur_repo_viewer.Api();
+                if(typeof api.GetCommitFiles !== 'function'){
+                    // svn 等实现不支持按需获取：回失败事件，避免前端一直显示加载中
+                    CallWeb('show-commit-files-failed', {path: v.path, revisions: v.revisions});
+                    return;
+                }
+                try{
+                    let files = await api.GetCommitFiles(v.path, v.revisions);
+                    CallWeb('show-commit-files', {path: v.path, files: files});
+                }catch(e){
+                    SendErrorToWeb('获取提交文件列表失败: ' + (e?.message || String(e)));
+                    CallWeb('show-commit-files-failed', {path: v.path, revisions: v.revisions});
+                }
+            },
             "get-repo-properties":function(v){
                 g_sys_params.cur_repo_viewer.Api().GetRepoProperty(v).then((data) => {
                     CallWeb('show-repo-properties', data)

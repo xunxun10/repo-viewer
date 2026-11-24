@@ -9,6 +9,9 @@ const {MyDevTool} = require('../util/my_devtool');
 const { url } = require('inspector');
 const RepoSearch = require('./repo_search');
 
+// 单次目录展开时并发执行的 git 进程上限，避免 ARM 等低配设备被大量子进程拖慢
+const FILE_INFO_CONCURRENCY = 6;
+
 class GitCommandApi {
     constructor(repo_url, user, password, os_type, cache_dir) {
         this.repo_url = repo_url;
@@ -131,6 +134,29 @@ class GitCommandApi {
             MyLog.Error(msg);
         }
         return msg;
+    }
+
+    /**
+     * 按指定并发数执行异步任务，避免一次性启动过多 git 子进程
+     * @param {Array} items 待处理列表
+     * @param {number} limit 最大并发数
+     * @param {Function} worker 处理函数，参数为 (item, index)
+     */
+    async _RunWithConcurrency(items, limit, worker) {
+        const results = new Array(items.length);
+        let nextIndex = 0;
+        const run = async () => {
+            while (true) {
+                const index = nextIndex++;
+                if (index >= items.length) {
+                    return;
+                }
+                results[index] = await worker(items[index], index);
+            }
+        };
+        const runnerCount = Math.max(1, Math.min(limit, items.length));
+        await Promise.all(Array.from({ length: runnerCount }, run));
+        return results;
     }
 
     async RefreshRepoTree(repo_url){
@@ -320,8 +346,8 @@ class GitCommandApi {
                 }
             }
             
-            // 获取每个tag的最后提交时间，并按时间降序排序
-            const tagsWithDate = await Promise.all(tags.map(async tag => {
+            // 获取每个tag的最后提交时间，并按时间降序排序（限制并发，避免 tag 较多时启动过多 git 进程）
+            const tagsWithDate = await this._RunWithConcurrency(tags, FILE_INFO_CONCURRENCY, async tag => {
                 try {
                     // 获取tag指向的最后一次提交的日期
                     const dateRes = await this._GetGitCommandResult(`log -1 --pretty=format:"%ad" --date=iso ${tag}`);
@@ -332,7 +358,7 @@ class GitCommandApi {
                     // 如果无法获取提交时间，使用 epoch(0) 作为 fallback
                     return { tag, date: new Date(0) };
                 }
-            }));
+            });
 
             // 按时间降序排序；对于相同时间，按 tag 名称升序以保证确定性
             return tagsWithDate
@@ -350,19 +376,21 @@ class GitCommandApi {
 
     async _GetTree(branch, filePath) {
         if(filePath == ''){
-            var res = await this._GetGitCommandResult(`ls-tree --abbrev=7 ${branch}`);
+            // -l 会在同一条命令中返回文件大小，避免再为每个文件执行 cat-file -s
+            var res = await this._GetGitCommandResult(`ls-tree -l --abbrev=7 ${branch}`);
         }else{
-            var res = await this._GetGitCommandResult(`ls-tree --abbrev=7 ${branch} "${filePath}/"`);
+            var res = await this._GetGitCommandResult(`ls-tree -l --abbrev=7 ${branch} "${filePath}/"`);
         }
         let lines = res.split('\n').filter(line => line);
         let tree = { dirs: [], files: [] };
 
         lines.forEach(line => {
-            // ls-tree输出格式: <mode> SP <type> SP <object> TAB <file>，文件名可能含空格，需用TAB分割
+            // ls-tree输出格式: <mode> SP <type> SP <object> SP <size> TAB <file>，文件名可能含空格，需用TAB分割
             const parts = line.split('\t');
             const metaParts = parts[0].split(/\s+/);
             const mode = metaParts[0], type = metaParts[1], hash = metaParts[2];
-            let curFilePath = parts.length > 1 ? parts[1] : metaParts.slice(3).join(' ');
+            const sizeNum = type === 'blob' ? (parseInt(metaParts[3], 10) || 0) : 0;
+            let curFilePath = parts.length > 1 ? parts[1] : metaParts.slice(4).join(' ');
             // 去除filePath中的前缀filePath,注意需要从第一个字符开始匹配
             // 转义filePath中的正则特殊字符（如.变成\.），防止new RegExp时误匹配
             const escapedPrefix = filePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -371,13 +399,13 @@ class GitCommandApi {
                 let cur_node = { text: curFilePath, date: '', children: ["."] };
                 tree.dirs.push(cur_node);
             } else {
-                let cur_node = { text: curFilePath, revision: hash, author: '', date: '', size: '' };
+                let cur_node = { text: curFilePath, revision: hash, author: '', date: '', size: MyUnit.FileSizeStr(sizeNum), size_num: sizeNum };
                 tree.files.push(cur_node);
             }
         });
 
-        // 获取文件的作者、日期、大小（所有文件并行查询）
-        await Promise.all(tree.files.map(async (file) => {
+        // 获取文件的作者和日期；限制并发数，避免 ARM 等设备同时启动过多 git 进程
+        await this._RunWithConcurrency(tree.files, FILE_INFO_CONCURRENCY, async (file) => {
             // 拼接完整路径
             const full_path = path.join(filePath, file.text);
             // 如果为submodule，需要跳过
@@ -389,25 +417,17 @@ class GitCommandApi {
                 return;
             }
             try {
-                let logPromise = this._GetGitCommandResult(`log -1 --pretty=format:"%an|%ad" --date=iso -- "${full_path}"`);
-                let sizePromise = this._GetGitCommandResult(`cat-file -s ${file.revision}`);
-
-                let [logRes, sizeRes] = await Promise.all([logPromise, sizePromise]);
-
+                let logRes = await this._GetGitCommandResult(`log -1 --pretty=format:"%an|%ad" --date=iso -- "${full_path}"`);
                 let [author, date] = logRes.split('|');
                 file.author = author;
                 file.date = MyDate.GetDateStr(new Date(date), true);
-                file.size = MyUnit.FileSizeStr(sizeRes);
-                file.size_num = parseInt(sizeRes);
             } catch (error) {
-                // 捕获异常，设置默认值
+                // 捕获异常，设置默认值（文件大小已由 ls-tree -l 取得，无需重置）
                 file.author = 'unknown';
                 file.date = '0000-00-00 00:00:00';
-                file.size = MyUnit.FileSizeStr(0);
-                file.size_num = 0;
                 MyLog.Error(`Failed to get file info for ${full_path}: ${error.message}`);
             }
-        }));
+        });
         return tree;
     }
 
@@ -509,8 +529,8 @@ class GitCommandApi {
         // 如果url中指定的是branches但未指定具体分支，则返回所有分支目录
         if (branchType === 'branches' && branch === '') {
             const branches = await this._GetBranches();
-            // Get date information for each branch
-            const branchesWithDates = await Promise.all(branches.map(async branch => {
+            // 获取每个分支的日期（限制并发，避免分支较多时启动过多 git 进程）
+            const branchesWithDates = await this._RunWithConcurrency(branches, FILE_INFO_CONCURRENCY, async branch => {
                 try {
                     const dateInfo = await this._GetGitCommandResult(`log -1 --pretty=format:"%ad" --date=iso origin/${branch}`);
                     const formattedDate = MyDate.GetDateStr(new Date(dateInfo), true);
@@ -518,7 +538,7 @@ class GitCommandApi {
                 } catch (error) {
                     return { branch, date: '' };
                 }
-            }));
+            });
             
             return {
                 url: repo_url,
@@ -673,62 +693,93 @@ class GitCommandApi {
         } else {
             var res = await this._GetGitCommandResult(`log ${gitLogTarget} ${only_self} -${limit} ${pretty} --date=iso -- "${filePath}"`);
         }
-        let logs = await Promise.all(res.split('\n').map(async line => {
+        // 只返回提交元数据，涉及的文件列表在用户点选提交时按需加载（见 GetCommitFiles）
+        let logs = res.split('\n').map(line => {
             // 如果line为空，则直接返回
             if(!line){
                 return;
             }
             let [revision, author, date, msg] = line.split('|');
             let date_str = MyDate.GetDateStr(new Date(date), true);
-            // 将每次提交涉及的文件列表加入到日志中，文件对象格式如 {action, path, kind, text_mods, prop_mods, copy_from}
-            let files = [];
-            // 放弃的命令：show --name-status -m --first-parent --oneline ${revision}
-            // 放弃的命令：show --cc -m --name-status --oneline ${revision}
-            // 放弃的命令：diff --oneline  --name-status --find-renames=80% ${revision}^@ ${revision}
-            try {
-                var filesRes = await this._GetGitCommandResult(`diff --oneline  --name-status --find-renames=80% "${revision}^" "${revision}"`, this.repo_path, false);
-                // 如果是show则需要去掉第一行
-                var fileLines = filesRes.split('\n').filter(line => line);
-            } catch (error) {
-                // 如果是第一个提交，直接显示该提交的内容
-                var filesRes = await this._GetGitCommandResult(`show --name-status --oneline ${revision}`);
-                // 如果是show则需要去掉第一行
-                var fileLines = filesRes.split('\n').slice(1).filter(line => line);
-            }
-            fileLines.forEach(line => {
-                // line样式为：M<tab>utils.py  或 R<num><tab>old_path<tab>new_path
-                // 忽略空行和以#开头的行
-                if(!line || line.startsWith('#')){
-                    return;
-                }
-                // git diff --name-status 输出使用TAB分隔，避免文件名含空格时解析错误
-                const tabParts = line.split('\t');
-                const statusPart = tabParts[0];
-                let action = statusPart.replace(/R\d+/, 'R');
-                let path = '', copy_from = '';
-
-                if (action === 'R') {
-                    // 重命名格式: R<num><tab>old_path<tab>new_path
-                    path = tabParts[2] || '';
-                    copy_from = tabParts[1] || '';
-                } else {
-                    path = tabParts.slice(1).join('\t');
-                }
-                
-                // 如果filePath有值，则需要过滤掉非本文件路径的条目
-                if(filePath && !path.startsWith(filePath)){
-                    return;
-                }
-                // path需要带上branchtype和branch信息
-                path = this._GenAbsPath(branchType, branch, '', path);
-                files.push({ action: action, path, kind: 'file', text_mods: true, prop_mods: false, copy_from: copy_from });
-            });
-            return { revision, author, date:date_str, msg, files };
-        }));
+            return { revision, author, date: date_str, msg };
+        });
         if(!logs[0]){
             return [];
         }
         return logs;
+    }
+
+    /**
+     * 按需获取指定提交涉及的文件列表（日志弹框点击提交时调用）
+     * @param {string} repo_url 当前查看的仓库路径
+     * @param {Array<string>} revisions 需要获取文件列表的提交hash
+     * @returns {Object} key为提交hash，value为文件列表
+     */
+    async GetCommitFiles(repo_url, revisions) {
+        const [branchType, branch, filePath] = this._ExtractBranchFromUrl(repo_url);
+        await this._CloneOrUpdateRepo(branchType, branch, filePath);
+        if(!Array.isArray(revisions)){
+            revisions = revisions ? [revisions] : [];
+        }
+        // 去重，避免重复查询同一个提交
+        revisions = Array.from(new Set(revisions.filter(rev => rev)));
+        const filesMap = {};
+        await this._RunWithConcurrency(revisions, FILE_INFO_CONCURRENCY, async revision => {
+            filesMap[revision] = await this._GetCommitFilesByRevision(revision, branchType, branch, filePath);
+        });
+        return filesMap;
+    }
+
+    /**
+     * 获取单个提交涉及的文件列表
+     * @param {string} revision 提交hash
+     * @param {string} branchType 分支类型
+     * @param {string} branch 分支名
+     * @param {string} filePath 当前过滤的文件路径，为空表示整个提交
+     */
+    async _GetCommitFilesByRevision(revision, branchType, branch, filePath) {
+        let files = [];
+        // 放弃的命令：show --name-status -m --first-parent --oneline ${revision}
+        // 放弃的命令：show --cc -m --name-status --oneline ${revision}
+        // 放弃的命令：diff --oneline  --name-status --find-renames=80% ${revision}^@ ${revision}
+        try {
+            var filesRes = await this._GetGitCommandResult(`diff --oneline --name-status --find-renames=80% "${revision}^" "${revision}"`, this.repo_path, false);
+            var fileLines = filesRes.split('\n').filter(line => line);
+        } catch (error) {
+            // 如果是第一个提交，直接显示该提交的内容
+            var filesRes = await this._GetGitCommandResult(`show --name-status --oneline ${revision}`);
+            // 如果是show则需要去掉第一行
+            var fileLines = filesRes.split('\n').slice(1).filter(line => line);
+        }
+        fileLines.forEach(line => {
+            // line样式为：M<tab>utils.py  或 R<num><tab>old_path<tab>new_path
+            // 忽略空行和以#开头的行
+            if(!line || line.startsWith('#')){
+                return;
+            }
+            // git diff --name-status 输出使用TAB分隔，避免文件名含空格时解析错误
+            const tabParts = line.split('\t');
+            const statusPart = tabParts[0];
+            let action = statusPart.replace(/R\d+/, 'R');
+            let path = '', copy_from = '';
+
+            if (action === 'R') {
+                // 重命名格式: R<num><tab>old_path<tab>new_path
+                path = tabParts[2] || '';
+                copy_from = tabParts[1] || '';
+            } else {
+                path = tabParts.slice(1).join('\t');
+            }
+
+            // 如果filePath有值，则需要过滤掉非本文件路径的条目
+            if(filePath && !path.startsWith(filePath)){
+                return;
+            }
+            // path需要带上branchtype和branch信息
+            path = this._GenAbsPath(branchType, branch, '', path);
+            files.push({ action: action, path, kind: 'file', text_mods: true, prop_mods: false, copy_from: copy_from });
+        });
+        return files;
     }
 
     async GetRepoProperty(file_url, version = 'HEAD') {

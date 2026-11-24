@@ -5,6 +5,13 @@ function _IsGitRepoView(){
     return url.endsWith('.git') || url.includes('git@') || url.includes('.git/');
 }
 
+// 当前日志弹框中选中的行索引，用于按需加载文件列表完成后重新渲染
+var _log_selected_indexs = [];
+// 正在请求文件列表的提交，避免重复请求
+var _log_commit_files_loading = {};
+// 当前日志弹框对应的仓库路径，用于丢弃切换路径后返回的过期结果
+var _log_dialog_path = '';
+
 // 将包含{revision, author, date, msg}的数组转换为html字符串
 function ShowLogDialog(v){
     var html = `<div id='log-item-container'><table><thead><tr class='log-item log-item-head'>
@@ -27,6 +34,10 @@ function ShowLogDialog(v){
     }
     html += '</tbody></table></div>';
     gv.gv_log_data = v;
+    // 重置按需加载状态：git 提交的文件列表在点击提交时再获取
+    _log_selected_indexs = [];
+    _log_commit_files_loading = {};
+    _log_dialog_path = _GetSelPath();
     // 显示修改的文件列表 v.files:[{path, action}]
     html += `<div id='log-file-container'></div><div id='log-msgs-container'></div>`;
     // git 仓库支持强制拉取远端更新后刷新提交记录
@@ -226,13 +237,89 @@ function _IsLogPathRelated(p, cur_path, copy_map){
 }
 
 function ShowLogFiles(indexs){
+    _log_selected_indexs = indexs.slice();
+    // git 提交的文件列表按需加载：收集当前选中行中尚未加载的提交，批量请求一次
+    if(_IsGitRepoView()){
+        var missing_revisions = [];
+        for(var i = 0; i < indexs.length; i++){
+            var cur_v = gv.gv_log_data[indexs[i]];
+            if(cur_v && cur_v.files === undefined && !_log_commit_files_loading[cur_v.revision]){
+                _log_commit_files_loading[cur_v.revision] = true;
+                missing_revisions.push(cur_v.revision);
+            }
+        }
+        if(missing_revisions.length > 0){
+            CallSys('get-commit-files', {path:_GetSelPath(), revisions: missing_revisions});
+        }
+    }
+    _RenderLogFiles(indexs);
+}
+
+// 文件列表按需加载完成/失败后由后台事件调用
+function OnCommitFilesLoaded(v){
+    // 只处理当前日志弹框对应路径的结果，丢弃切换路径后返回的过期数据
+    if(v && v.path && v.path !== _log_dialog_path){
+        return;
+    }
+    var files_map = (v && v.files) ? v.files : {};
+    Object.keys(files_map).forEach(function(rev){
+        delete _log_commit_files_loading[rev];
+    });
+    // 弹框已关闭时忽略结果。这里不能判断 #my-info 的 in 类：bootstrap 的 in 类在淡入
+    // 动画（约300ms）后才会加上，而缓存命中时后台几十毫秒就返回，会导致结果被丢弃且
+    // 加载标记已清除，界面一直停留在 Loading changed files...
+    if(!$('#log-item-container').length){
+        return;
+    }
+    var logs = gv.gv_log_data || [];
+    for(var i = 0; i < logs.length; i++){
+        if(Object.prototype.hasOwnProperty.call(files_map, logs[i].revision)){
+            logs[i].files = files_map[logs[i].revision] || [];
+        }
+    }
+    if(_log_selected_indexs.length > 0){
+        ShowLogFiles(_log_selected_indexs);
+    }
+}
+
+function OnCommitFilesFailed(v){
+    if(v && v.path && v.path !== _log_dialog_path){
+        return;
+    }
+    var revisions = (v && v.revisions) ? v.revisions : [];
+    revisions.forEach(function(rev){
+        delete _log_commit_files_loading[rev];
+    });
+    // 弹框已关闭时忽略结果（不判断 in 类，原因同上）
+    if(!$('#log-item-container').length){
+        return;
+    }
+    // 标记为空列表，避免一直显示加载中；具体错误已由后台弹框提示
+    var logs = gv.gv_log_data || [];
+    for(var i = 0; i < logs.length; i++){
+        if(revisions.indexOf(logs[i].revision) !== -1 && logs[i].files === undefined){
+            logs[i].files = [];
+        }
+    }
+    if(_log_selected_indexs.length > 0){
+        ShowLogFiles(_log_selected_indexs);
+    }
+}
+
+function _RenderLogFiles(indexs){
     var html = '';
-    // 聚合所有files信息
+    // 聚合所有已加载的files信息
     var files = [];
+    var has_loading = false;
     for(var i = 0; i < indexs.length; i++){
         var cur_v = gv.gv_log_data[indexs[i]];
-        if (cur_v.files) {
+        if(!cur_v){
+            continue;
+        }
+        if(cur_v.files){
             files.push(...cur_v.files);
+        }else if(_IsGitRepoView() && cur_v.files === undefined){
+            has_loading = true;
         }
     }
     // 去重
@@ -269,6 +356,9 @@ function ShowLogFiles(indexs){
             no_diff_class = 'not-diff';
         }
         html += `<div class='log-file-item ${no_diff_class}'><span class='log-file-action'>${files[i].action}</span><span class='log-prop-action' title="属性变更"></span>|<span class='log-file-path'>${files[i].path}</span>${copy_from_str}</div>`;
+    }
+    if(has_loading){
+        html += `<div class='log-file-loading'>Loading changed files...</div>`;
     }
     $('#log-file-container').html(html);
     // 双击文件获取文件变更内容

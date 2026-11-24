@@ -37,6 +37,10 @@ function _CreateRepoTreeNode(repo){
                         "separator_after": false,
                         "label": "refresh",
                         "action": function (obj) {
+                            // 标记本次刷新，树更新完成后由 show-repo-tree 显示提示
+                            gv.gv_refresh_node_pending = true;
+                            // 清空该节点及其子节点的缓存，确保刷新后重新读取
+                            _ClearNodeCache(node);
                             CallSys("refresh-repo", gv.gv_repo_url);
                             // 菜单点击逻辑，obj.reference（节点的 DOM 元素），也可以直接使用node变量
                             _RefreshNodeChildren(node);
@@ -251,6 +255,12 @@ function _AddRepoTreeEvent(tree_jq_obj){
         // 展开时获取子节点
         $('#repo-tree').on('before_open.jstree', function (e, data) {
             var node = data.node;
+            // 折叠后重新展开且分支未变化时，直接复用已加载的子节点，避免重复执行大量 git 命令
+            if(_CanReuseNodeCache(node)){
+                SetSelectNode(node);
+                $('#repo-tree').jstree('select_node', node, true);
+                return;
+            }
             _RefreshNodeChildren(node);
         });
 
@@ -284,6 +294,59 @@ function _RefreshNodeChildren(node){
         path = cur_node.text + '/' + path;
     }
     CallSys('get-repo-node', gv.gv_repo_url + '/' + path);
+}
+
+/**
+ * 判断当前仓库是否为 git 仓库（与后台 RepoViewer._GetRepoType 保持一致）
+ */
+function _IsGitRepoTree(){
+    var url = gv.gv_repo_url || '';
+    return url.endsWith('.git') || url.includes('git@') || url.includes('.git/');
+}
+
+/**
+ * 判断节点是否可以复用已加载的缓存（折叠后重新展开，且分支未变化）
+ * 仅 git 使用该缓存；svn 每次展开仍从服务器读取最新数据，保持原有行为
+ */
+function _CanReuseNodeCache(node){
+    if(!_IsGitRepoTree()){
+        return false;
+    }
+    if(!node || !gv.gv_tree_cache){
+        return false;
+    }
+    const cached = gv.gv_tree_cache[node.id];
+    if(!cached || !cached.tree){
+        return false;
+    }
+    // 还未加载过子节点时不能复用
+    if(!node.children || node.children.length === 0){
+        return false;
+    }
+    // 分支或 tag 变化后缓存失效
+    const cached_url = cached.url || cached.tree.url || '';
+    return _GetBrName(_GetSelPath(node)) === _GetBrName(cached_url);
+}
+
+/**
+ * 递归清空节点及其子节点的缓存，用于强制刷新
+ */
+function _ClearNodeCache(node){
+    if(!node || !gv.gv_tree_cache){
+        return;
+    }
+    delete gv.gv_tree_cache[node.id];
+    const tree = $('#repo-tree').jstree(true);
+    if(!tree){
+        return;
+    }
+    const children = node.children || [];
+    for(let i = 0; i < children.length; i++){
+        const child = tree.get_node(children[i]);
+        if(child){
+            _ClearNodeCache(child);
+        }
+    }
 }
 
 

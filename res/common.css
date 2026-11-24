@@ -475,6 +475,11 @@ tr,th,td{
     cursor: pointer;
     background-color: var(--color-hover);
 }
+.log-file-loading{
+    margin: 5px 0px;
+    color: var(--color-text-muted);
+    font-size: 13px;
+}
 
 /* diff信息区域 */
 #diff-info{
