@@ -35,12 +35,21 @@ function OpenSettingsPanel(settings){
     // 生成包含设置项的html代码
     var html = `<table class='settings-table'>`;
     settings.forEach(setting => {
-        const escapedValue = String(setting.value).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-        const escapedHelp = String(setting.help).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-        html += `<tr>
-                    <td>${setting.desc}:</td>
-                    <td><input type='text' class='modal-input settings-value' id='settings-${setting.name}' value="${escapedValue}" title="${escapedHelp}"></td>
-                </tr>`;
+        const rawValue = (setting.value === undefined || setting.value === null) ? '' : String(setting.value);
+        const escapedValue = rawValue.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        const escapedHelp = String(setting.help || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        if (setting.type === 'textarea') {
+            const escapedText = rawValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            html += `<tr>
+                        <td>${setting.desc}:</td>
+                        <td><textarea class='modal-input settings-value' id='settings-${setting.name}' rows='${setting.rows || 5}' title="${escapedHelp}">${escapedText}</textarea></td>
+                    </tr>`;
+        } else {
+            html += `<tr>
+                        <td>${setting.desc}:</td>
+                        <td><input type='text' class='modal-input settings-value' id='settings-${setting.name}' value="${escapedValue}" title="${escapedHelp}"></td>
+                    </tr>`;
+        }
     });
     html += `</table>`;
 

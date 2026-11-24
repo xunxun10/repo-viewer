@@ -50,6 +50,7 @@ var g_sys_params = {
     encryp_key: null,
     repo_cache_dir: "",
     ide_cmd: '',
+    ide_cmd_rules: '',  // 按文件扩展名配置的编辑器命令规则，每行格式 .ext=command
 }
 
 var viewer_db = new ViewerDb();
@@ -321,6 +322,7 @@ async function Init(){
     MyFile.MkDir(g_sys_params.tmp_dir);
 
     g_sys_params.ide_cmd = g_conf.GetOrSet('ide_cmd', '');
+    g_sys_params.ide_cmd_rules = g_conf.GetOrSet('ide_cmd_rules', '');
     g_sys_params.daily_update_time = g_conf.GetOrSet('daily_update_time', '06:00');
     g_sys_params.daily_update_count = parseInt(g_conf.GetOrSet('daily_update_count', 6), 10);
 
@@ -650,15 +652,16 @@ function HandleWebMsg(event, msg){
             "get-repo-file":function(v){
                 let api = g_sys_params.cur_repo_viewer.Api();
                 let ide_cmd = g_sys_params.ide_cmd;
+                let ide_cmd_rules = g_sys_params.ide_cmd_rules;
                 // 使用vscode等打开文件
                 if (api.GetCacheStatus()){
                     var local_path = api.GetLocalPath(v);
                     var local_repo_path = api.GetLocalRepoPath();
-                    MyOs.OpenFileWithIde(local_path, local_repo_path, ide_cmd);
+                    MyOs.OpenFileWithIde(local_path, local_repo_path, ide_cmd, ide_cmd_rules);
                 }else{
                     let tmp_file = path.join(g_sys_params.tmp_dir, path.basename(v));
                     api.ExportRepoFile(v, tmp_file).then((data) => {
-                        MyOs.OpenFileWithIde(tmp_file, g_sys_params.tmp_dir, ide_cmd);
+                        MyOs.OpenFileWithIde(tmp_file, g_sys_params.tmp_dir, ide_cmd, ide_cmd_rules);
                     })
                 }
             },
@@ -826,7 +829,15 @@ function OpenSettings() {
         name: 'ide_cmd',
         desc: 'File Edit Command',
         value: g_sys_params.ide_cmd,
-        help: 'Custom File Edit Command, for example, for VSCode: code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"',
+        help: 'Default editor command when no file type rule matches, for example, for VSCode: code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"',
+    },
+    {
+        name: 'ide_cmd_rules',
+        desc: 'File Type Edit Command Rules',
+        value: g_sys_params.ide_cmd_rules,
+        type: 'textarea',
+        rows: 6,
+        help: 'One rule per line, format: .ext=command (extension is case-insensitive). Unmatched files use the default File Edit Command above. Example: .md=typora "%%FILE_PATH%%"',
     },
     {
         name: 'repo_cache_dir',

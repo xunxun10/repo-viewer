@@ -30,6 +30,30 @@ function parseCmdArgs(cmd) {
     return parts;
 }
 
+/**
+ * 解析按文件扩展名配置的编辑器命令规则
+ * 每行格式：.md=typora "%%FILE_PATH%%"，支持以 # 或 ; 开头的注释行
+ * 扩展名不区分大小写，可带或不带前导点
+ * @param {string} rules - 多行规则文本
+ * @returns {Object<string,string>} 以 .ext 为键的命令映射
+ */
+function parseIdeCmdRules(rules) {
+    const map = {};
+    if (!rules) return map;
+    for (const line of String(rules).split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
+        const eqIndex = trimmed.indexOf('=');
+        if (eqIndex <= 0) continue;
+        let ext = trimmed.slice(0, eqIndex).trim().toLowerCase();
+        const cmd = trimmed.slice(eqIndex + 1).trim();
+        if (!ext || !cmd) continue;
+        if (!ext.startsWith('.')) ext = '.' + ext;
+        map[ext] = cmd;
+    }
+    return map;
+}
+
 class MyOs{
 
     /**
@@ -71,7 +95,27 @@ class MyOs{
 
     }
 
-    static OpenFileWithIde(file_path, dir_path='', ide_cmd=''){
+    /**
+     * 根据文件扩展名从规则中获取对应的编辑器命令，未匹配时返回默认命令
+     * @param {string} file_path 文件路径
+     * @param {string} default_cmd 默认编辑器命令
+     * @param {string} ide_cmd_rules 按扩展名配置的多行规则
+     * @returns {string}
+     */
+    static GetIdeCmdForFile(file_path, default_cmd='', ide_cmd_rules=''){
+        const ext = path.extname(file_path || '').toLowerCase();
+        if(ext){
+            const rules = parseIdeCmdRules(ide_cmd_rules);
+            if(rules[ext]){
+                return rules[ext];
+            }
+        }
+        return default_cmd || '';
+    }
+
+    static OpenFileWithIde(file_path, dir_path='', ide_cmd='', ide_cmd_rules=''){
+        // 优先使用按文件扩展名配置的编辑器命令，未匹配时沿用默认命令
+        ide_cmd = MyOs.GetIdeCmdForFile(file_path, ide_cmd, ide_cmd_rules);
         if(!ide_cmd){
             if(process.platform == 'win32'){
                 ide_cmd = 'code -n "%%DIR_PATH%%" -- "%%FILE_PATH%%"';
