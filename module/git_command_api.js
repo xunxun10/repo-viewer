@@ -1,6 +1,7 @@
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const ini = require('ini');
 const MyLog = require('../util/my_log');
 const crypto = require('crypto');
 const MyFile = require('../util/my_file');
@@ -1162,7 +1163,10 @@ CommitID(${tag}): ${commit || '(未知)'}
     }
 
     /**
-     * 获取git submodule status获取子模块路径，返回一个dict，key为子模块路径，value为commitid
+     * 获取子模块路径，返回dict（key为子模块路径，value为true）
+     * 直接解析 .gitmodules：`git submodule status` 会串行启动多个 git 子进程，
+     * Windows/低配设备上耗时可达 1~2 秒，导致含子模块的仓库打开明显变慢；
+     * 这里只判断路径是否为子模块，不需要状态和 commit id。
      */
     async _GetSubmodulePath(){
         let submodule_path_dict = {};
@@ -1172,36 +1176,25 @@ CommitID(${tag}): ${commit || '(未知)'}
                 return submodule_path_dict;
             }
 
-            // 使用 git submodule status 获取子模块状态
-            const result = await this._GetGitCommandResult('submodule status', this.repo_path, false);
-            if (!result || !result.trim()) {
-                return submodule_path_dict;
-            }
-
-            // 解析结果，格式为：
-            // +hash path (branch)
-            // -hash path (branch)
-            // 空格hash path (branch)
-            const lines = result.trim().split('\n');
-            for (const line of lines) {
-                const trimmedLine = line.trim();
-                if (!trimmedLine) continue;
-
-                // 提取 commit ID 和路径
-                // 格式：[+- ]?[commit_hash] [path] ([branch])
-                const parts = trimmedLine.split(' ');
-                if (parts.length >= 2) {
-                    const commitId = parts[0].replace(/^[+-]/, ''); // 移除前缀+/-
-                    let path = parts[1];
-                    // 需要将path分割符按照os类型进行转换
-                    if(this.os_type == 'windows'){
-                        path = path.replace(/\//g, '\\');
-                    }
-                    submodule_path_dict[path] = commitId;
+            const cfg = ini.parse(fs.readFileSync(gitmodulesPath, 'utf-8'));
+            Object.keys(cfg).forEach(key => {
+                // 节名格式：submodule "lib/base"
+                if(!/^submodule\s+/i.test(key)){
+                    return;
                 }
-            }
+                const item = cfg[key];
+                if(!item || !item.path){
+                    return;
+                }
+                // 需要将path分割符按照os类型进行转换，与 _GetTree 中的 full_path 保持一致
+                let subPath = item.path;
+                if(this.os_type == 'windows'){
+                    subPath = subPath.replace(/\//g, '\\');
+                }
+                submodule_path_dict[subPath] = true;
+            });
         } catch (error) {
-            MyLog.Warn(`获取子模块状态失败: ${error.message}`);
+            MyLog.Warn(`获取子模块路径失败: ${error.message}`);
         }
         return submodule_path_dict;
     }
