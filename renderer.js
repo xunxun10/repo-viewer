@@ -225,19 +225,25 @@ function UpdateRepoUrl(repo_url){
 }
 
 /**
- * 显示笔记差异
+ * 显示 diff 差异
  * @param {*} pre_content 前一个版本的内容
  * @param {*} cur_content 当前版本的内容
- * @param {*} diff_mode 差异模式，line表示按行对比，word表示按单词对比，char表示按字符对比，默认按行对比
+ * @param {*} title 弹框标题
+ * @param {*} diff_mode 差异模式，line表示按行对比，word表示按单词对比，char表示按字符对比；不传时优先使用diff设置中保存的模式，默认按字母
  */
-function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line'){
-    var color = '', span = null;
-
+function ShowDiff(pre_content, cur_content, title='diff info', diff_mode=null){
     // 如果内容相同则弹框提示
     if(pre_content === cur_content){
         MyModal.Alert("内容相同，无差异");
         return;
     }
+
+    // 会话级保存设置（内存中），每次打开比较界面生效但不写入磁盘
+    if(typeof window._diff_saved_settings === 'undefined') window._diff_saved_settings = {};
+    var _diff_saved_settings = window._diff_saved_settings;
+
+    // 比对模式：显式传入的diff_mode优先，其次使用diff设置中保存的模式，默认按字母
+    var mode = diff_mode || _diff_saved_settings.mode || 'char';
 
     // 使用可滚动的两列布局：左侧行为行号，右侧为内容；整体容器保留 id='diff-info' 以兼容滚动/跳转逻辑
     var display = $("<div id='diff-info' class='diff-view'></div>");
@@ -246,25 +252,187 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
     var content = document.createElement('div');
     content.className = 'diff-content';
 
-    // 行号计数器：针对最终版本（cur_content）所有非-removed 的行都参与计数（包括不变的数据）
-    var finalLineNo = 1;
+    // 修复 diff 面板的文本选择问题：
+    // 1) 禁止拖动已选中的文字触发浏览器原生拖拽，否则再次按下时不会重新建立选区，而是沿用旧选区起点；
+    // 2) 在已有选区内按下鼠标时先清除旧选区，保证每次拖动都从按下位置重新开始选择。
+    var diffViewEl = display[0];
+    diffViewEl.addEventListener('dragstart', function(e){
+        e.preventDefault();
+    }, true);
+    diffViewEl.addEventListener('mousedown', function(e){
+        if(e.button !== 0 || e.shiftKey){
+            return;
+        }
+        var sel = window.getSelection();
+        if(sel && !sel.isCollapsed && sel.containsNode && sel.containsNode(e.target, true)){
+            sel.removeAllRanges();
+        }
+    }, true);
 
-    var diff;
-    // 如果cur_content末尾不是换行符，则两边各增加一个换行符
-    if(!/^\r?\n$/.test(cur_content)){
+    // 两边末尾不是换行符时各自补齐，保证按行配对时最后一行完整
+    if(!/\r?\n$/.test(pre_content)){
         pre_content += '\n';
+    }
+    if(!/\r?\n$/.test(cur_content)){
         cur_content += '\n';
     }
-    if(diff_mode == 'char'){
-        diff = Diff.diffChars(pre_content, cur_content);
-    }else if(diff_mode == 'word'){
-        diff = Diff.diffWords(pre_content, cur_content);
-    }else{
-        diff = Diff.diffLines(pre_content, cur_content);
+
+    /**
+     * 按行分割文本并保留每行末尾的换行符（最后一行可能不带换行符）
+     */
+    function splitLinesWithEnd(text){
+        if(!text) return [];
+        return text.match(/[^\n]*\n|[^\n]+$/g) || [];
     }
-    // 会话级保存设置（内存中），每次打开比较界面生效但不写入磁盘
-    if(typeof window._diff_saved_settings === 'undefined') window._diff_saved_settings = {};
-    var _diff_saved_settings = window._diff_saved_settings;
+
+    /**
+     * 向结果数组追加差异片段，相邻同类型片段合并
+     */
+    function appendDiffPart(parts, value, added, removed){
+        if(!value) return;
+        var last = parts[parts.length - 1];
+        if(last && !!last.added === added && !!last.removed === removed){
+            last.value += value;
+        }else{
+            parts.push({value: value, added: added, removed: removed});
+        }
+    }
+
+    // 差异计算的最大编辑距离：jsdiff 在差异较多时耗时急剧增长，超过上限时直接中止
+    var DIFF_MAX_EDIT_LENGTH = 1000;
+
+    /**
+     * 差异过大时的降级方案：逐行按下标对比，耗时与文本长度线性相关，保证界面不卡死
+     */
+    function fallbackLineDiff(pre_text, cur_text){
+        var pre_lines = splitLinesWithEnd(pre_text);
+        var cur_lines = splitLinesWithEnd(cur_text);
+        var result = [];
+        var count = Math.max(pre_lines.length, cur_lines.length);
+        for(var i = 0; i < count; i++){
+            var old_line = i < pre_lines.length ? pre_lines[i] : '';
+            var new_line = i < cur_lines.length ? cur_lines[i] : '';
+            if(old_line === new_line){
+                appendDiffPart(result, old_line, false, false);
+                continue;
+            }
+            if(old_line !== ''){
+                appendDiffPart(result, old_line, false, true);
+            }
+            if(new_line !== ''){
+                appendDiffPart(result, new_line, true, false);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 行级差异（带编辑距离上限），超限时降级为逐行对比
+     */
+    function safeDiffLines(pre_text, cur_text){
+        var parts = Diff.diffLines(pre_text, cur_text, {maxEditLength: DIFF_MAX_EDIT_LENGTH});
+        return parts || fallbackLineDiff(pre_text, cur_text);
+    }
+
+    /**
+     * 字符级差异的安全实现：先按行定位变更块，再仅对变更块内的行做字符级比对。
+     * jsdiff 的 diffChars 在两边内容差异较大时耗时急剧增长（几千字符即可卡死界面），
+     * 因此不能对整篇内容直接调用。
+     */
+    function safeDiffChars(pre_text, cur_text){
+        var line_parts = safeDiffLines(pre_text, cur_text);
+        var result = [];
+        var removed_text = '';
+        var added_text = '';
+        // 单行过长时（如整段无换行的大文本）改用单词级比对，避免再次拖慢界面
+        var CHAR_DIFF_MAX_LEN = 800;
+        // 字符级细化耗时预算：超出后剩余的变更行只做整行标记，保证界面不长时间无响应
+        var REFINE_TIME_BUDGET_MS = 300;
+        var refine_start_time = Date.now();
+        var refine_disabled = false;
+
+        function flushChangedBlock(){
+            if(removed_text === '' && added_text === '') return;
+            var pre_lines = splitLinesWithEnd(removed_text);
+            var cur_lines = splitLinesWithEnd(added_text);
+            var count = Math.max(pre_lines.length, cur_lines.length);
+            for(var i = 0; i < count; i++){
+                var old_line = i < pre_lines.length ? pre_lines[i] : '';
+                var new_line = i < cur_lines.length ? cur_lines[i] : '';
+                if(old_line === ''){
+                    appendDiffPart(result, new_line, true, false);
+                    continue;
+                }
+                if(new_line === ''){
+                    appendDiffPart(result, old_line, false, true);
+                    continue;
+                }
+                if(old_line === new_line){
+                    appendDiffPart(result, old_line, false, false);
+                    continue;
+                }
+                if(!refine_disabled && Date.now() - refine_start_time > REFINE_TIME_BUDGET_MS){
+                    refine_disabled = true;
+                }
+                // 超出预算后不再做字符级细化，直接整行标记
+                if(refine_disabled){
+                    appendDiffPart(result, old_line, false, true);
+                    appendDiffPart(result, new_line, true, false);
+                    continue;
+                }
+                var diff_parts;
+                if(old_line.length + new_line.length > CHAR_DIFF_MAX_LEN){
+                    diff_parts = Diff.diffWords(old_line, new_line, {maxEditLength: DIFF_MAX_EDIT_LENGTH});
+                }else{
+                    diff_parts = Diff.diffChars(old_line, new_line, {maxEditLength: DIFF_MAX_EDIT_LENGTH});
+                }
+                // 细化失败时退化为整行标记
+                if(!diff_parts){
+                    appendDiffPart(result, old_line, false, true);
+                    appendDiffPart(result, new_line, true, false);
+                    continue;
+                }
+                for(var j = 0; j < diff_parts.length; j++){
+                    appendDiffPart(result, diff_parts[j].value, !!diff_parts[j].added, !!diff_parts[j].removed);
+                }
+            }
+            removed_text = '';
+            added_text = '';
+        }
+
+        for(var i = 0; i < line_parts.length; i++){
+            var part = line_parts[i];
+            if(part.added){
+                added_text += part.value;
+            }else if(part.removed){
+                removed_text += part.value;
+            }else{
+                flushChangedBlock();
+                appendDiffPart(result, part.value, false, false);
+            }
+        }
+        flushChangedBlock();
+        return result;
+    }
+
+    /**
+     * 根据比对模式计算差异
+     */
+    function computeDiff(cur_mode){
+        if(cur_mode == 'char'){
+            return safeDiffChars(pre_content, cur_content);
+        }else if(cur_mode == 'word'){
+            // 内容很大时单词级比对同样可能卡顿，回退为行级比对
+            if(pre_content.length + cur_content.length > 40000){
+                return safeDiffLines(pre_content, cur_content);
+            }
+            return Diff.diffWords(pre_content, cur_content, {maxEditLength: DIFF_MAX_EDIT_LENGTH}) ||
+                   safeDiffLines(pre_content, cur_content);
+        }
+        return safeDiffLines(pre_content, cur_content);
+    }
+
+    var diff = computeDiff(mode);
 
     // render 函数：根据 filterRegexStr 与 showOnlyChanges 设置渲染内容
     function render(filterRegexStr, showOnlyChanges, excludeRegexStr){
@@ -294,9 +462,33 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
             }
         }
 
-        // 行号计数器：针对最终版本（cur_content）所有非-removed 的行都参与计数（包括不变的数据）
-        var localFinalLineNo = 1;
-        var linePrefix = '';  // 存储同行内删除数据前的非删除内容，因为一行可能包含多个part
+        // 先将diff parts按行分组：每个元素为 {segs:[{text,color}], hasChange, isRemovedLine}
+        // 以便"只显示变更行"按整行判定，保证有变更的行完整显示
+        var lineGroups = [];
+        var curSegs = [];
+        var curHasChange = false;
+        var curIsAllRed = true;    // 当前行是否全部为删除内容（纯删除行）
+        var curHasContent = false; // 当前行是否有内容（含空行变更）
+
+        function pushSeg(text, color){
+            // 只要存在非删除（绿色/未变更）内容，该行就不是纯删除行
+            if(color !== 'red'){ curIsAllRed = false; }
+            if(color !== ''){ curHasChange = true; }
+            curHasContent = true;
+            var last = curSegs[curSegs.length - 1];
+            if(last && last.color === color){
+                last.text += text;
+            }else{
+                curSegs.push({text: text, color: color});
+            }
+        }
+        function endLine(){
+            lineGroups.push({segs: curSegs, hasChange: curHasChange, isRemovedLine: curHasContent && curIsAllRed});
+            curSegs = [];
+            curHasChange = false;
+            curIsAllRed = true;
+            curHasContent = false;
+        }
 
         diff.forEach(function(part){
             var partColor = part.added ? 'green' : part.removed ? 'red' : '';
@@ -306,91 +498,96 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
             if(lines.length > 1 && partEndsWithNewline){
                 lines.pop(); // Remove the empty string after the final newline
             }
-            var isRemoved = !!part.removed;
 
             for(var i = 0; i < lines.length; i++){
-                var cur_line = lines[i];
-
-                // 判断当前行是否含有换行符（以换行符结束）
                 var isLineEnd = (i < lines.length - 1) || partEndsWithNewline;
-                var isEmptyLineNo =  false;
-
-                // 当前行在最终版本的行号
-                var currentLineNo = null;
-                // 删除行不显示行号，如果是删除行但linePrefix有值，也需要显示行号（linePrefix表示删除行前还有非删除的内容）
+                pushSeg(lines[i], partColor);
                 if(isLineEnd){
-                    if (!isRemoved || linePrefix !== ''){
-                        currentLineNo = localFinalLineNo;
-                        localFinalLineNo++;
-                    }else{
-                        isEmptyLineNo = true;
-                    }
+                    endLine();
                 }
+            }
+        });
+        // 末尾未换行的残段也作为一行处理
+        if(curHasContent){
+            endLine();
+        }
 
-                // 过滤与"仅显示变更"判定（注意：即便被过滤，行号仍按未过滤数据计算）
-                var shouldRender = true;
-                if(re){
-                    // 对文本进行匹配（对 removed/added/unchanged 均使用该文本）
-                    shouldRender = re.test(cur_line);
-                }
-                // 排除正则过滤：满足排除正则的行不显示
-                if(excludeRe && excludeRe.test(cur_line)){
-                    shouldRender = false;
-                }
-                if(showOnlyChanges && partColor === ''){
-                    shouldRender = false;
-                }
+        // 行号计数器：针对最终版本（cur_content）所有非-removed 的行都参与计数（包括不变的数据）
+        var localFinalLineNo = 1;
 
-                if(!shouldRender){
-                    // 即不渲染该行，但如果是非 removed 且是完整行，则行号计数已增加
-                    continue;
-                }
+        lineGroups.forEach(function(group){
+            // 整行文本（用于正则过滤）
+            var lineText = group.segs.map(function(s){ return s.text; }).join('');
 
-                if(isLineEnd){
-                    // gutter: 只有非-removed 的完整行显示行号，removed 或不完整行显示占位
-                    var gutterLine = document.createElement('div');
-                    gutterLine.className = 'diff-gutter-line';
-                    if(!isEmptyLineNo){
-                        gutterLine.appendChild(document.createTextNode(currentLineNo));
-                    }else{
-                        gutterLine.appendChild(document.createTextNode(''));
-                    }
-                    gutter.appendChild(gutterLine);
-                }
+            // 过滤与"仅显示变更"判定（注意：即便被过滤，行号仍按未过滤数据计算）
+            var shouldRender = true;
+            if(re){
+                shouldRender = re.test(lineText);
+            }
+            // 排除正则过滤：满足排除正则的行不显示
+            if(excludeRe && excludeRe.test(lineText)){
+                shouldRender = false;
+            }
+            if(showOnlyChanges && !group.hasChange){
+                shouldRender = false;
+            }
 
-                if(partColor === ''){
-                    content.appendChild(document.createTextNode(cur_line));
+            // 当前行在最终版本的行号：纯删除行不显示行号（占位），其余行都计数
+            var currentLineNo = null;
+            var isEmptyLineNo = false;
+            if(!group.isRemovedLine){
+                currentLineNo = localFinalLineNo;
+                localFinalLineNo++;
+            }else{
+                isEmptyLineNo = true;
+            }
+
+            if(!shouldRender){
+                return;
+            }
+
+            // gutter: 纯删除行显示占位，其余显示行号
+            var gutterLine = document.createElement('div');
+            gutterLine.className = 'diff-gutter-line';
+            if(!isEmptyLineNo){
+                gutterLine.appendChild(document.createTextNode(currentLineNo));
+            }else{
+                gutterLine.appendChild(document.createTextNode(''));
+            }
+            gutter.appendChild(gutterLine);
+
+            // 内容：每行使用独立的块级元素，使该行宽度撑满整行（而不是只有文字部分可选中），
+            // 这样在行尾空白处开始拖动时，选区锚点仍然落在当前行。
+            var lineEl = document.createElement('div');
+            lineEl.className = 'diff-line';
+            // 有变更的段着色，无变更的段以纯文本显示（整行完整输出）
+            group.segs.forEach(function(seg){
+                if(seg.color === ''){
+                    lineEl.appendChild(document.createTextNode(seg.text));
                 }else{
                     var inner = document.createElement('span');
-                    inner.className = 'diff-span ' + partColor;
-                    if(cur_line === ''){
+                    inner.className = 'diff-span ' + seg.color;
+                    if(seg.text === ''){
                         var zwc_ele = document.createElement('span');
                         zwc_ele.className = 'diff-line-break';
                         inner.appendChild(zwc_ele);
                     }else{
-                        inner.appendChild(document.createTextNode(cur_line));
+                        inner.appendChild(document.createTextNode(seg.text));
                     }
-                    content.appendChild(inner);
+                    lineEl.appendChild(inner);
                 }
-                // Add line break after each line except for the last line in a part that doesn't end with newline
-                if(isLineEnd){
-                    content.appendChild(document.createElement('br'));
-                    linePrefix = '';
-                }else{
-                    if(!isRemoved){
-                        linePrefix += cur_line;
-                    }
-                }
-            }
+            });
+            content.appendChild(lineEl);
         });
 
         // 根据最终行号计算 gutter 宽度（按数字位数估算）
         var maxLine = Math.max(1, localFinalLineNo - 1);
+        // 行号宽度按实际最大行号位数自动计算
         var digits = String(maxLine).length;
         var gutterWidth = Math.min(200, Math.max(20, digits * 8 + 7));
 
         // 计算 gutter 高度，确保背景色和边框完整显示
-        var gutterHeight = gutter.children.length * 20 + 12; // 每行20px
+        var gutterHeight = gutter.children.length * 22 + 12; // 每行22px（与CSS行高保持一致）
 
         // 将容器插入显示面板（如果尚未插入）
         // `display` 是 jQuery 对象，使用其 DOM 元素进行 contains/append 操作
@@ -412,9 +609,9 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
         gutter.style.height = gutterHeight + 'px';
     }
 
-    // 首次渲染：使用已保存设置（如果有），否则显示全部
+    // 首次渲染：使用已保存设置（如果有）；"只显示变更行"默认不勾选
     var initRegex = _diff_saved_settings.regex || '';
-    var initOnly = !!_diff_saved_settings.onlyChanges;
+    var initOnly = _diff_saved_settings.onlyChanges === true;
     var initExclude = _diff_saved_settings.excludeRegex || '';
     render(initRegex, initOnly, initExclude);
     MyModal.Info(display, title, '1000px', '600px', 'diff');
@@ -433,7 +630,8 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
     function updateSettingsIcon(){
         var hasSettings = (_diff_saved_settings.regex || '') !== '' ||
                           (_diff_saved_settings.excludeRegex || '') !== '' ||
-                          !!_diff_saved_settings.onlyChanges;
+                          !!_diff_saved_settings.onlyChanges ||
+                          (_diff_saved_settings.mode || '') !== 'char';
         var iconSpan = settings_btn.find('span');
         if(hasSettings){
             iconSpan.removeClass('glyphicon-cog').addClass('glyphicon-exclamation-sign');
@@ -447,64 +645,115 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
     diff_btns.append(pre_btn);
     diff_btns.append(next_btn);
     diff_btns.append(pre_copy_btn);
-    // 只对行模式显示settings按钮
-    if(diff_mode === 'line'){
-        diff_btns.append(settings_btn);
+    diff_btns.append(settings_btn);
+
+    // 变更跳转：所有位置计算都以 #diff-info 自身的可视区域为基准（而不是依赖 position() 的 offsetParent），
+    // 这样无论每行是内联文本还是独立的块级行元素，定位都一致。
+    function GetChangeSpans(){
+        return $("#diff-info .diff-span").toArray();
     }
 
-    pre_btn.click(()=>{
-        var cur_span_parent = $("#diff-info");
-        var cur_span_parent_scroll_top = cur_span_parent.scrollTop();
-        var find_flag = false;
-        // 倒序遍历#diff-info内的span元素
-        $($("#diff-info .diff-span").toArray().reverse()).each(function(index, ele_dom){
-            // 遍历#diff-info内的span元素，找到位于可视区域的前一个span元素
-            var cur_span = $(ele_dom);
-            // 相对于可视区域的位置
-            var cur_span_top = cur_span.position().top;
-            if(cur_span_top < 0){
-                cur_span_parent.scrollTop(cur_span_parent_scroll_top + cur_span_top - 30);
-                find_flag = true;
-                return false;
+    /**
+     * 将指定变更滚动到可视区域顶部（留出 30px 余量）
+     */
+    function ScrollToChangeSpan(span){
+        var view_rect = diffViewEl.getBoundingClientRect();
+        var span_rect = span.getBoundingClientRect();
+        var delta = span_rect.top - view_rect.top;
+        diffViewEl.scrollTop = diffViewEl.scrollTop + delta - 30;
+    }
+
+    // 变更跳转按钮的可用状态：上方/下方没有变更时置灰（disabled）
+    // 变更元素按文档顺序排列，因此只需检查第一个变更是否已在视口上方、最后一个变更是否在视口下方
+    function CanJumpPrev(){
+        var first = GetChangeSpans()[0];
+        if(!first){
+            return false;
+        }
+        return first.getBoundingClientRect().top < diffViewEl.getBoundingClientRect().top;
+    }
+
+    function CanJumpNext(){
+        var spans = GetChangeSpans();
+        var last = spans[spans.length - 1];
+        if(!last){
+            return false;
+        }
+        return last.getBoundingClientRect().top - diffViewEl.getBoundingClientRect().top >= diffViewEl.clientHeight;
+    }
+
+    function UpdateJumpButtons(){
+        pre_btn.prop('disabled', !CanJumpPrev());
+        next_btn.prop('disabled', !CanJumpNext());
+    }
+
+    // 滚动时更新按钮状态，用 requestAnimationFrame 合并高频滚动事件
+    var jump_update_pending = false;
+    function ScheduleUpdateJumpButtons(){
+        if(jump_update_pending){
+            return;
+        }
+        jump_update_pending = true;
+        window.requestAnimationFrame(function(){
+            jump_update_pending = false;
+            // 弹框关闭后元素已从 DOM 移除，无需再更新
+            if(!document.body.contains(diffViewEl)){
+                return;
             }
+            UpdateJumpButtons();
         });
+    }
+
+    diffViewEl.addEventListener('scroll', ScheduleUpdateJumpButtons);
+
+    function OnDiffWindowResize(){
+        if(!document.body.contains(diffViewEl)){
+            window.removeEventListener('resize', OnDiffWindowResize);
+            return;
+        }
+        ScheduleUpdateJumpButtons();
+    }
+    window.addEventListener('resize', OnDiffWindowResize);
+
+    pre_btn.click(()=>{
+        var spans = GetChangeSpans();
+        var view_top = diffViewEl.getBoundingClientRect().top;
+        var find_flag = false;
+        // 倒序遍历变更元素，找到完全位于可视区域上方的最近一个变更
+        for(var i = spans.length - 1; i >= 0; i--){
+            if(spans[i].getBoundingClientRect().top < view_top){
+                ScrollToChangeSpan(spans[i]);
+                find_flag = true;
+                break;
+            }
+        }
         if(!find_flag){
             // 提示已无数据
             MyModal.Toast("已到顶");
         }
     });
     next_btn.click(()=>{
-        var cur_span_parent = $("#diff-info");
-        var cur_span_parent_scroll_top = cur_span_parent.scrollTop();
+        var spans = GetChangeSpans();
+        var view_rect = diffViewEl.getBoundingClientRect();
         var find_flag = false;
-        // 顺序遍历#diff-info内的span元素
-        $("#diff-info .diff-span").each(function(index, ele_dom){
-            // 遍历#diff-info内的span元素，找到位于可视区域的前一个span元素
-            var cur_span = $(ele_dom);
-            // 相对于可视区域的位置
-            var cur_span_top = cur_span.position().top;
-            if(cur_span_top > 0){
-                if(cur_span_top < cur_span_parent.height()){
-                    return; // continue
-                }
-                cur_span_parent.scrollTop(cur_span_parent_scroll_top + cur_span_top - 30);
+        // 顺序遍历变更元素，找到位于可视区域下方的最近一个变更
+        for(var i = 0; i < spans.length; i++){
+            if(spans[i].getBoundingClientRect().top - view_rect.top >= diffViewEl.clientHeight){
+                ScrollToChangeSpan(spans[i]);
                 find_flag = true;
-                return false;
+                break;
             }
-        });
+        }
         if(!find_flag){
             // 提示已无数据
             MyModal.Toast("已到底");
         }
     });
     top_btn.click(()=>{
-        var cur_span_parent = $("#diff-info");
-        cur_span_parent.scrollTop(0);
         // 跳转到第一个变更
-        var first_span = $("#diff-info .diff-span").first();
-        if(first_span.length > 0){
-            var first_span_top = first_span.position().top;
-            cur_span_parent.scrollTop(first_span_top - 30);
+        var first_span = $("#diff-info .diff-span").get(0);
+        if(first_span){
+            ScrollToChangeSpan(first_span);
         }
     });
 
@@ -512,14 +761,25 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
         CopyText(pre_content);
     });
 
-    // 设置按钮：打开弹窗，允许输入行文本过滤正则以及是否只显示变更
+    // 设置按钮：打开弹窗，可设置比对模式、行文本过滤正则以及是否只显示变更
     settings_btn.click(()=>{
         // 使用已保存的默认值回显
         var saved = _diff_saved_settings || {};
         var savedRegex = saved.regex || '';
         var savedOnly = saved.onlyChanges ? 'checked' : '';
         var savedExclude = saved.excludeRegex || '';
+        var modeCharChecked = mode === 'char' ? 'checked' : '';
+        var modeWordChecked = mode === 'word' ? 'checked' : '';
+        var modeLineChecked = mode === 'line' ? 'checked' : '';
         var html = `
+        <div class='form-group'>
+            <label>比对模式</label>
+            <div>
+                <label class='radio-inline'><input type='radio' name='diff-settings-mode' value='char' ${modeCharChecked}> 按字母</label>
+                <label class='radio-inline'><input type='radio' name='diff-settings-mode' value='word' ${modeWordChecked}> 按单词</label>
+                <label class='radio-inline'><input type='radio' name='diff-settings-mode' value='line' ${modeLineChecked}> 按行</label>
+            </div>
+        </div>
         <div class='form-group'>
             <label>行文本过滤正则（空为不使用）</label>
             <input type='text' id='diff-settings-regex' class='form-control' placeholder='例如: ^ERROR' value="${savedRegex}">
@@ -532,6 +792,7 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
             <label><input type='checkbox' id='diff-settings-only-changes' ${savedOnly}> 只显示变更行</label>
         </div>`;
         MyModal.Alert(html, function(){
+            var modeStr = $('input[name="diff-settings-mode"]:checked').val() || 'char';
             var regexStr = $('#diff-settings-regex').val() || '';
             var excludeRegexStr = $('#diff-settings-exclude-regex').val() || '';
             var onlyChanges = $('#diff-settings-only-changes').is(':checked');
@@ -543,17 +804,25 @@ function ShowDiff(pre_content, cur_content, title='diff info', diff_mode='line')
                 try{ new RegExp(excludeRegexStr); }catch(e){ MyModal.Alert('排除正则表达式无效: ' + e); return; }
             }
             // 保存设置到会话内存（不写入磁盘）
+            _diff_saved_settings.mode = modeStr;
             _diff_saved_settings.regex = regexStr;
             _diff_saved_settings.excludeRegex = excludeRegexStr;
             _diff_saved_settings.onlyChanges = onlyChanges;
             // 更新设置图标
             updateSettingsIcon();
-            // 重新渲染 diff（行号仍使用未过滤的计数）
+            // 按新模式重新计算差异并渲染（行号仍使用未过滤的计数）
+            mode = modeStr;
+            diff = computeDiff(modeStr);
             render(regexStr, onlyChanges, excludeRegexStr);
-        }, 600, 240, 'Diff Settings');
+            // 重新渲染后变更元素位置变化，刷新跳转按钮状态
+            ScheduleUpdateJumpButtons();
+        }, 600, null, 'Diff Settings');
     });
 
     display.append(diff_btns);
+
+    // 首次展示后刷新跳转按钮状态（此时弹框已插入 DOM，可测量尺寸）
+    ScheduleUpdateJumpButtons();
 }
 
 function ShowFileDiff(pre_content, new_content, title){

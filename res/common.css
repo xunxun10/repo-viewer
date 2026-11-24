@@ -509,22 +509,30 @@ tr,th,td{
     background: var(--color-bg);
     border-right: 1px solid var(--color-border-light);
     text-align: right;
-    font-size: 12px;
+    font-family: "Cascadia Code", "Fira Code", Consolas, "Microsoft YaHei UI", monospace;
+    font-size: 13px;
     color: var(--color-text-muted);
     user-select: none; /* 避免复制时带上行号 */
     flex-shrink: 0; /* 防止flex压缩 */
 }
 .diff-gutter-line{
-    line-height: 20px;
-    height: 20px;
+    line-height: 22px;
+    height: 22px;
     overflow: hidden;
 }
 .diff-content{
     flex: 1;
     padding: 6px 10px;
     white-space: pre;
-    line-height: 20px;
+    font-family: "Cascadia Code", "Fira Code", Consolas, "Microsoft YaHei UI", monospace;
+    line-height: 22px;
     font-size: 14px;
+    tab-size: 4;
+}
+/* 每行独立成块并撑满整行宽度，避免只有文字部分才算“行宽”，行尾空白处也能作为选区起点 */
+.diff-line{
+    min-height: 22px;
+    white-space: pre;
 }
 .diff-btns{
     /* 固定显示在右侧中间位置 */
@@ -547,6 +555,11 @@ tr,th,td{
 }
 .diff-btns button{
     margin-bottom: 10px;
+}
+/* 已无对应方向的变更时置灰按钮（置灰后仍保留位置避免按钮跳动） */
+.diff-btns button:disabled{
+    opacity: 0.35;
+    cursor: not-allowed;
 }
 
 
