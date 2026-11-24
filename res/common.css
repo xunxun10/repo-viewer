@@ -442,6 +442,10 @@ tr,th,td{
     text-align: right;
 }
 
+#log-operation .btn + .btn{
+    margin-left: 6px;
+}
+
 /* 提交对应的修改文件列表对话框 */
 .log-file-item{
     margin: 5px 0px;

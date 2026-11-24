@@ -681,6 +681,18 @@ function HandleWebMsg(event, msg){
                     ShowCacheStatus();
                 })
             },
+            "refresh-repo-log":async function(v){
+                // git 仓库刷新提交记录：强制更新当前分支缓存后重新读取日志
+                let api = g_sys_params.cur_repo_viewer.Api();
+                try{
+                    let data = await api.GetRepoLog(v, null, null, true);
+                    CallWeb('show-refreshed-repo-log', {path: v, logs: data});
+                    ShowCacheStatus();
+                }catch(e){
+                    SendErrorToWeb('刷新提交记录失败: ' + (e?.message || String(e)));
+                    CallWeb('refresh-repo-log-failed');
+                }
+            },
             "get-repo-properties":function(v){
                 g_sys_params.cur_repo_viewer.Api().GetRepoProperty(v).then((data) => {
                     CallWeb('show-repo-properties', data)

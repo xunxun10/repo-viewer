@@ -1,4 +1,10 @@
 
+// 判断当前查看的仓库是否为 git 仓库（与后台 RepoViewer._GetRepoType 保持一致）
+function _IsGitRepoView(){
+    var url = gv.gv_repo_url || '';
+    return url.endsWith('.git') || url.includes('git@') || url.includes('.git/');
+}
+
 // 将包含{revision, author, date, msg}的数组转换为html字符串
 function ShowLogDialog(v){
     var html = `<div id='log-item-container'><table><thead><tr class='log-item log-item-head'>
@@ -22,7 +28,13 @@ function ShowLogDialog(v){
     html += '</tbody></table></div>';
     gv.gv_log_data = v;
     // 显示修改的文件列表 v.files:[{path, action}]
-    html += `<div id='log-file-container'></div><div id='log-msgs-container'></div><div id='log-operation'><button id='more-log-btn' class='btn btn-default'><span class=''>More</span></button></div>`;
+    html += `<div id='log-file-container'></div><div id='log-msgs-container'></div>`;
+    // git 仓库支持强制拉取远端更新后刷新提交记录
+    var _op_btns = `<button id='more-log-btn' class='btn btn-default'><span class=''>More</span></button>`;
+    if(_IsGitRepoView()){
+        _op_btns = `<button id='refresh-log-btn' class='btn btn-default' title='强制更新当前分支缓存（fetch + rebase）并重新加载提交记录'>Refresh</button>` + _op_btns;
+    }
+    html += `<div id='log-operation'>${_op_btns}</div>`;
 
     MyModal.Info(html, `${_GetSelPath()} commit log`);
 
@@ -81,6 +93,16 @@ function ShowLogDialog(v){
         var last_log_index = gv.gv_log_data.length - 1;
         var last_log_revision = gv.gv_log_data[last_log_index].revision;
         CallSys('get-more-repo-log', {path:_GetSelPath(), from_revision:last_log_revision});
+    });
+
+    $("#refresh-log-btn").off('click').on('click', function(){
+        var $btn = $(this);
+        if($btn.prop('disabled')){
+            return;
+        }
+        // 强制后台更新当前分支缓存（fetch + checkout + rebase），完成后由 show-refreshed-repo-log 重建列表
+        $btn.prop('disabled', true).text('Refreshing...');
+        CallSys('refresh-repo-log', _GetSelPath());
     });
 
     // 默认点击第一行

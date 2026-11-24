@@ -7,7 +7,8 @@ var g_bc = {
     targetUrl: '',     // 当前目标分支 URL
     targetName: '',    // 当前目标分支名
     defaultBranch: '', // 后端计算出的默认分支 URL（主线/main）
-    mode: 'latest',   // 'latest'=与目标分支最新版比对(默认); 'base'=与目标分支拉分支时版本比对
+    mode: 'latest',   // 'latest'=与目标分支最新版比对(默认); 'base'=以分叉点比对，忽略目标分支后续改动（始终等于实际生效的模式）
+    forkPref: false,  // 用户是否勾选"忽略目标分支后续改动"的偏好；目标分支不支持时暂按最新版，切回支持的分支后恢复
 };
 
 /**
@@ -24,8 +25,8 @@ function ShowBranchCompareDialog(data){
     <div id='bc-head'>
         <span class='bc-label'>目标分支:</span>
         <select id='bc-branch-select'></select>
-        <label id='bc-fork-label' class='bc-latest-label' title='勾选则与目标分支拉分支时的版本比对；不勾选默认与目标分支最新版比对'>
-            <input type='checkbox' id='bc-fork-mode'> 与目标分支拉分支时的版本比对
+        <label id='bc-fork-label' class='bc-latest-label' title='勾选后以两分支的分叉点为准比对，忽略目标分支分叉之后的更新；不勾选则与目标分支最新版比对'>
+            <input type='checkbox' id='bc-fork-mode'> 忽略目标分支后续改动（与分叉点比对）
         </label>
         <span id='bc-hint' class='bc-hint'></span>
     </div>
@@ -55,7 +56,7 @@ function ShowBranchCompareDialog(data){
         $('#bc-branch-select').val(target);
     }
 
-    // 仅当默认分支可计算 且 当前选中目标分支==该默认分支 时，才允许"与拉分支时版本"比对；否则强制最新版
+    // 仅当默认分支可计算 且 当前选中目标分支==该默认分支 时，才允许"忽略目标分支后续改动"比对；否则强制最新版
     _UpdateForkAvail();
 
     // 切换目标分支时重新比对
@@ -67,9 +68,10 @@ function ShowBranchCompareDialog(data){
         _CompareBranches();
     });
 
-    // 切换比对模式（勾选=与目标分支拉分支时版本比对；默认=最新版）
+    // 切换比对模式（勾选=忽略目标分支后续改动；默认=最新版）
     $('#bc-fork-mode').off('change').on('change', function(){
-        g_bc.mode = $(this).is(':checked') ? 'base' : 'latest';
+        g_bc.forkPref = $(this).is(':checked');
+        g_bc.mode = g_bc.forkPref ? 'base' : 'latest';
         _CompareBranches();
     });
 
@@ -84,14 +86,18 @@ function _GetTargetName(url){
     return url;
 }
 
-// 仅当默认分支可计算 且 当前选中目标分支==该默认分支 时，允许拉分支时版本比对；否则不可用并强制最新版
+// 仅当默认分支可计算 且 当前选中目标分支==该默认分支 时，允许忽略目标分支后续改动；否则不可用并强制最新版
+// 复选框勾选状态始终由实际生效的 g_bc.mode 决定，避免“显示未勾选但实际按分叉点比对”
 function _UpdateForkAvail(){
     var ok = !!g_bc.defaultBranch && !!g_bc.targetUrl && g_bc.targetUrl === g_bc.defaultBranch;
+    var $fork = $('#bc-fork-mode');
     if(ok){
-        $('#bc-fork-mode').prop('disabled', false);
+        g_bc.mode = g_bc.forkPref ? 'base' : 'latest';
+        $fork.prop('disabled', false).prop('checked', g_bc.mode === 'base');
     }else{
+        // 当前目标分支不支持按分叉点比对，但保留 forkPref，切回支持的分支时自动恢复
         g_bc.mode = 'latest';
-        $('#bc-fork-mode').prop('checked', false).prop('disabled', true);
+        $fork.prop('checked', false).prop('disabled', true);
     }
 }
 
@@ -102,7 +108,7 @@ function _CompareBranches(){
     }
     g_bc.targetName = _GetTargetName(g_bc.targetUrl);
     $('#bc-hint').text('正在比对: ' + g_bc.baseBranchName + ' ↔ ' + g_bc.targetName
-        + (g_bc.mode === 'latest' ? '(最新版)' : '(拉分支时)') + ' ...');
+        + (g_bc.mode === 'latest' ? '(最新版)' : '(分叉点)') + ' ...');
     $('#bc-file-list').html('<div class="bc-empty">加载中...</div>');
     CallSys('compare-branch', { baseRoot: g_bc.baseRoot, targetUrl: g_bc.targetUrl, mode: g_bc.mode });
 }

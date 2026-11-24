@@ -619,6 +619,7 @@ class GitCommandApi {
      * @param {*} repo_url 
      * @param {*} start_rev 起始版本号，不包含该版本
      * @param {*} end_rev 结束版本号，不包含该版本
+     * @param {boolean} force 是否强制从远端拉取更新（刷新提交记录时使用）
      * @returns 返回的日志格式为 [{revision, author, date, msg, files: [{action, path, kind, text_mods, prop_mods, copy_from}]}]
      * action: A-添加，M-修改，D-删除
      * path: 文件路径，需要带上branchtype和branch信息，以/开头
@@ -627,9 +628,9 @@ class GitCommandApi {
      * prop_mods: 是否是属性修改
      * copy_from: 复制自哪个版本路径
      */
-    async GetRepoLog(repo_url, start_rev = null, end_rev = null) {
+    async GetRepoLog(repo_url, start_rev = null, end_rev = null, force = false) {
         const [branchType, branch, filePath] = this._ExtractBranchFromUrl(repo_url);
-        await this._CloneOrUpdateRepo(branchType, branch, filePath);
+        await this._CloneOrUpdateRepo(branchType, branch, filePath, force);
         MyLog.Info('get log of: ' + repo_url);
         let range = "";
         let only_self = '';

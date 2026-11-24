@@ -80,6 +80,20 @@ if(typeof window.electronAPI != 'undefined'){
             "show-more-repo-log":function(v){
                 AppendLogMsg(v);
             },
+            "show-refreshed-repo-log":function(v){
+                // 刷新期间用户可能已关闭日志弹框或切到了其它路径，此时忽略过期结果
+                if($("#log-item-container").length === 0 || !$("#my-info").hasClass('in')){
+                    return;
+                }
+                if(v.path !== _GetSelPath()){
+                    return;
+                }
+                ShowLogDialog(v.logs);
+                Info('commit log refreshed');
+            },
+            "refresh-repo-log-failed":function(){
+                $("#refresh-log-btn").prop('disabled', false).text('Refresh');
+            },
             "show-repo-file-diff":function(v){
                 // {pre: 'xxx', new: 'xxx'}
                 ShowFileDiff(v.pre, v.new, v.title);
