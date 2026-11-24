@@ -671,7 +671,8 @@ function HandleWebMsg(event, msg){
             },
             "get-repo-log":function(v){
                 g_sys_params.cur_repo_viewer.Api().GetRepoLog(v).then((data) => {
-                    CallWeb('show-repo-log', data)
+                    // 回传请求路径，前端按该路径加载/过滤提交文件，避免期间切换目录导致串数据
+                    CallWeb('show-repo-log', {path: v, logs: data})
                     ShowCacheStatus();
                 })
             },

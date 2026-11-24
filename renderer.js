@@ -83,7 +83,8 @@ if(typeof window.electronAPI != 'undefined'){
                 CallSys('get-saved-repo-list');
             },
             "show-repo-log":function(v){
-                ShowLogDialog(v);
+                // v: {path, logs}，path 为本次日志查询的请求路径
+                ShowLogDialog(v.logs, v.path);
             },
             "show-more-repo-log":function(v){
                 AppendLogMsg(v);
@@ -94,10 +95,10 @@ if(typeof window.electronAPI != 'undefined'){
                 if($("#log-item-container").length === 0){
                     return;
                 }
-                if(v.path !== _GetSelPath()){
+                if(v.path !== _log_dialog_path){
                     return;
                 }
-                ShowLogDialog(v.logs);
+                ShowLogDialog(v.logs, v.path);
                 Info('commit log refreshed');
             },
             "show-commit-files":function(v){

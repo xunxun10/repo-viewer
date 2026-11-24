@@ -7,13 +7,17 @@ function _IsGitRepoView(){
 
 // 当前日志弹框中选中的行索引，用于按需加载文件列表完成后重新渲染
 var _log_selected_indexs = [];
-// 正在请求文件列表的提交，避免重复请求
+// 正在请求文件列表的提交，避免重复请求（仅在同一个日志弹框内有效）
 var _log_commit_files_loading = {};
-// 当前日志弹框对应的仓库路径，用于丢弃切换路径后返回的过期结果
+// 当前日志弹框对应的仓库路径：后台返回日志时回传的请求路径。
+// 提交文件列表是按该路径过滤的，缓存和过滤都必须以它为基准，不能直接用当前选择路径
+// （用户可能在日志返回前切换了目录/文件）。
 var _log_dialog_path = '';
 
 // 将包含{revision, author, date, msg}的数组转换为html字符串
-function ShowLogDialog(v){
+// path: 本次日志数据对应的请求路径，缺省时取当前选择路径
+function ShowLogDialog(v, path){
+    _log_dialog_path = path || _GetSelPath();
     var html = `<div id='log-item-container'><table><thead><tr class='log-item log-item-head'>
     <th class='log-item-col log-item-revision'>Revision</th>
     <th class='log-item-col log-item-author'>Author</th>
@@ -23,7 +27,7 @@ function ShowLogDialog(v){
     html += '<tbody id="log-item-tbody">';
     if(Array.isArray(v) && v.length === 0){
         // 无提交记录：区分 git 分支相对 master 无差异的情况，给出明确提示而非空白面板
-        var _sel_path = _GetSelPath() || '';
+        var _sel_path = _log_dialog_path || '';
         var _empty_tip = '未获取到提交记录';
         if(_sel_path.indexOf('.git/branches/') !== -1){
             _empty_tip = '该分支相对于 master 没有独立提交（分支与 master 可能指向同一提交），因此没有可展示的提交记录。';
@@ -37,7 +41,6 @@ function ShowLogDialog(v){
     // 重置按需加载状态：git 提交的文件列表在点击提交时再获取
     _log_selected_indexs = [];
     _log_commit_files_loading = {};
-    _log_dialog_path = _GetSelPath();
     // 显示修改的文件列表 v.files:[{path, action}]
     html += `<div id='log-file-container'></div><div id='log-msgs-container'></div>`;
     // git 仓库支持强制拉取远端更新后刷新提交记录
@@ -47,7 +50,7 @@ function ShowLogDialog(v){
     }
     html += `<div id='log-operation'>${_op_btns}</div>`;
 
-    MyModal.Info(html, `${_GetSelPath()} commit log`);
+    MyModal.Info(html, `${_log_dialog_path} commit log`);
 
     var _last_shift_click = null;
     // 设置点击事件，可按住shift+鼠标同时选中多条
@@ -103,7 +106,8 @@ function ShowLogDialog(v){
         }
         var last_log_index = gv.gv_log_data.length - 1;
         var last_log_revision = gv.gv_log_data[last_log_index].revision;
-        CallSys('get-more-repo-log', {path:_GetSelPath(), from_revision:last_log_revision});
+        // 继续沿用弹框打开时的路径，保证追加的日志与当前列表来自同一目录/文件
+        CallSys('get-more-repo-log', {path:_log_dialog_path, from_revision:last_log_revision});
     });
 
     $("#refresh-log-btn").off('click').on('click', function(){
@@ -113,7 +117,7 @@ function ShowLogDialog(v){
         }
         // 强制后台更新当前分支缓存（fetch + checkout + rebase），完成后由 show-refreshed-repo-log 重建列表
         $btn.prop('disabled', true).text('Refreshing...');
-        CallSys('refresh-repo-log', _GetSelPath());
+        CallSys('refresh-repo-log', _log_dialog_path);
     });
 
     // 默认点击第一行
@@ -243,13 +247,22 @@ function ShowLogFiles(indexs){
         var missing_revisions = [];
         for(var i = 0; i < indexs.length; i++){
             var cur_v = gv.gv_log_data[indexs[i]];
-            if(cur_v && cur_v.files === undefined && !_log_commit_files_loading[cur_v.revision]){
-                _log_commit_files_loading[cur_v.revision] = true;
-                missing_revisions.push(cur_v.revision);
+            if(!cur_v){
+                continue;
             }
+            // 已加载且确实是按当前弹框路径加载的才可复用，避免复用其它目录/文件的过滤结果
+            if(cur_v.files !== undefined && cur_v._files_path === _log_dialog_path){
+                continue;
+            }
+            if(_log_commit_files_loading[cur_v.revision]){
+                continue;
+            }
+            _log_commit_files_loading[cur_v.revision] = true;
+            missing_revisions.push(cur_v.revision);
         }
         if(missing_revisions.length > 0){
-            CallSys('get-commit-files', {path:_GetSelPath(), revisions: missing_revisions});
+            // 始终使用弹框打开时的路径，保证文件列表与日志列表来自同一目录/文件
+            CallSys('get-commit-files', {path:_log_dialog_path, revisions: missing_revisions});
         }
     }
     _RenderLogFiles(indexs);
@@ -275,6 +288,8 @@ function OnCommitFilesLoaded(v){
     for(var i = 0; i < logs.length; i++){
         if(Object.prototype.hasOwnProperty.call(files_map, logs[i].revision)){
             logs[i].files = files_map[logs[i].revision] || [];
+            // 记录这批文件是按哪个路径过滤出来的
+            logs[i]._files_path = _log_dialog_path;
         }
     }
     if(_log_selected_indexs.length > 0){
@@ -299,6 +314,7 @@ function OnCommitFilesFailed(v){
     for(var i = 0; i < logs.length; i++){
         if(revisions.indexOf(logs[i].revision) !== -1 && logs[i].files === undefined){
             logs[i].files = [];
+            logs[i]._files_path = _log_dialog_path;
         }
     }
     if(_log_selected_indexs.length > 0){
@@ -311,15 +327,21 @@ function _RenderLogFiles(indexs){
     // 聚合所有已加载的files信息
     var files = [];
     var has_loading = false;
+    var is_git = _IsGitRepoView();
     for(var i = 0; i < indexs.length; i++){
         var cur_v = gv.gv_log_data[indexs[i]];
         if(!cur_v){
             continue;
         }
-        if(cur_v.files){
+        if(is_git){
+            // 只使用按当前弹框路径加载的文件列表，路径不一致视为未加载（会重新请求）
+            if(cur_v.files !== undefined && cur_v._files_path === _log_dialog_path){
+                files.push(...cur_v.files);
+            }else{
+                has_loading = true;
+            }
+        }else if(cur_v.files){
             files.push(...cur_v.files);
-        }else if(_IsGitRepoView() && cur_v.files === undefined){
-            has_loading = true;
         }
     }
     // 去重
@@ -331,11 +353,11 @@ function _RenderLogFiles(indexs){
         return !exists;
     });
 
-    // 按选中路径过滤文件列表：svn log -v 列出的是每条提交的全部变更文件（含与选中路径
+    // 按弹框路径过滤文件列表：svn log -v 列出的是每条提交的全部变更文件（含与选中路径
     // 无关的文件；pre-copy 提交的路径还位于源分支命名空间），pre-copy 路径经 copy 关系
     // 转换回当前分支路径后再匹配，只保留与选中路径相关的文件（提交列表由 svn log 自身
     // 按路径过滤，无需前端处理）。
-    var cur_path = _GetSelPath().replace(gv.gv_repo_head, '');
+    var cur_path = (_log_dialog_path || '').replace(gv.gv_repo_head, '');
     if(cur_path){
         var copy_map = _BuildCopyMap();
         files = files.filter(function(f){
